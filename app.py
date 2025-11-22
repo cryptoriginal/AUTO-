@@ -51,22 +51,19 @@ MIN_PROB_MANUAL = 75
 MIN_PROB_SCAN = 85
 MIN_RR = 2.1
 
-DEFAULT_TIMEFRAMES = [
-    "5m", "15m", "30m", "1h", "2h", "4h",
-    "6h", "12h", "1d", "1w"
-]
-
-SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
+DEFAULT_TIMEFRAMES = ["5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"]
+SCAN_TIMEFRAMES = ["15m","1h","4h"]
 
 AUTO_MAX_POSITIONS = 2
 AUTO_LEVERAGE = 3.0
 
 last_signal_time = {}
 auto_open_positions = set()
+SUPPORTED_BINGX = set()  # auto-filled on startup
 
 
 # ============================================================
-# CLIENTS
+# INITIALIZE CLIENTS
 # ============================================================
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -77,7 +74,26 @@ if BINGX_API_KEY and BINGX_API_SECRET:
 
 
 # ============================================================
-# MARKET DATA ENDPOINTS (TRIPLE FALLBACK)
+# AUTO-DETECT BINGX FUTURES SUPPORTED SYMBOLS
+# ============================================================
+
+def load_supported_bingx_symbols():
+    """
+    Pull all USDT-M futures symbols from BingX automatically.
+    """
+    global SUPPORTED_BINGX
+    try:
+        data = bingx.swap_v2_get_contracts()
+        lst = data.get("data", {}).get("contracts", [])
+        SUPPORTED_BINGX = {c["symbol"].replace("-USDT","USDT") for c in lst}
+        print("Supported BingX symbols loaded:", SUPPORTED_BINGX)
+    except Exception as e:
+        print("Failed loading supported BingX symbols:", e)
+        SUPPORTED_BINGX = set()
+
+
+# ============================================================
+# MARKET DATA SOURCES
 # ============================================================
 
 BINANCE_ENDPOINTS = [
@@ -89,13 +105,11 @@ OKX_ENDPOINT = "https://www.okx.com"
 
 
 # ============================================================
-# UNIVERSAL REQUEST FUNCTIONS
+# UNIVERSAL MARKET DATA CALLS
 # ============================================================
 
 def fetch_binance(path, params=None):
-    """Fallback #3: Binance futures with retry + backoff."""
     params = params or {}
-
     for endpoint in BINANCE_ENDPOINTS:
         url = endpoint + path
 
@@ -103,88 +117,87 @@ def fetch_binance(path, params=None):
             try:
                 r = requests.get(url, params=params, timeout=10)
 
-                if r.status_code in [418, 429, 451, 403] or r.status_code >= 500:
-                    time.sleep(1.2 * (attempt + 1))
+                if r.status_code in [418,429,451,403] or r.status_code >= 500:
+                    time.sleep(1.2 * (attempt+1))
                     continue
 
                 r.raise_for_status()
                 return r.json()
             except:
-                time.sleep(1.2 * (attempt + 1))
+                time.sleep(1.2 * (attempt+1))
 
     raise RuntimeError("Binance failed in all attempts.")
 
 
 def fetch_okx(symbol, interval):
-    """Fallback #2: OKX Candles"""
     try:
         url = f"{OKX_ENDPOINT}/api/v5/market/candles"
         r = requests.get(url, params={"instId": f"{symbol}-USDT-SWAP", "bar": interval}, timeout=10)
         r.raise_for_status()
         raw = r.json()
-        candles = []
-        for c in raw.get("data", []):
-            candles.append({
-                "open_time": c[0],
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5]),
-            })
-        return candles
-    except:
-        return None
 
-
-def fetch_bingx(symbol, interval):
-    """Primary: BingX USDT-M Futures candles"""
-    try:
-        data = bingx.market_get_candles(symbol, interval, 100)
-        candles = []
-        for c in data.get("data", []):
-            candles.append({
-                "open_time": c["t"],
-                "open": float(c["o"]),
-                "high": float(c["h"]),
-                "low": float(c["l"]),
-                "close": float(c["c"]),
-                "volume": float(c["v"]),
-            })
-        return candles
-    except:
-        return None
-
-
-# Wrapper for triple fallback
-def get_klines(symbol, interval):
-    # 1️⃣ Try BingX
-    c = fetch_bingx(symbol, interval)
-    if c and len(c) > 0:
-        return c
-
-    # 2️⃣ Try OKX
-    c = fetch_okx(symbol, interval)
-    if c and len(c) > 0:
-        return c
-
-    # 3️⃣ Try Binance
-    raw = fetch_binance("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": 100})
-    candles = []
-    for c in raw:
-        candles.append({
+        candles = [{
             "open_time": c[0],
             "open": float(c[1]),
             "high": float(c[2]),
             "low": float(c[3]),
             "close": float(c[4]),
             "volume": float(c[5]),
-        })
+        } for c in raw.get("data", [])]
+
+        return candles
+    except:
+        return None
+
+
+def fetch_bingx(symbol, interval):
+    try:
+        data = bingx.market_get_candles(symbol, interval, 100)
+        candles = [{
+            "open_time": c["t"],
+            "open": float(c["o"]),
+            "high": float(c["h"]),
+            "low": float(c["l"]),
+            "close": float(c["c"]),
+            "volume": float(c["v"]),
+        } for c in data.get("data", [])]
+
+        return candles
+    except:
+        return None
+
+
+def get_klines(symbol, interval):
+    # 1️⃣ BingX
+    c = fetch_bingx(symbol, interval)
+    if c:
+        return c
+
+    # 2️⃣ OKX
+    c = fetch_okx(symbol, interval)
+    if c:
+        return c
+
+    # 3️⃣ Binance
+    raw = fetch_binance("/fapi/v1/klines", {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": 100
+    })
+
+    candles = [{
+        "open_time": c[0],
+        "open": float(c[1]),
+        "high": float(c[2]),
+        "low": float(c[3]),
+        "close": float(c[4]),
+        "volume": float(c[5]),
+    } for c in raw]
+
     return candles
 
 
 def get_top_symbols():
-    """Get top symbols by 24h volume from Binance (safe to use occasionally)."""
     try:
         data = fetch_binance("/fapi/v1/ticker/24hr")
     except:
@@ -195,6 +208,7 @@ def get_top_symbols():
         if s.get("symbol", "").endswith("USDT")
         and float(s.get("quoteVolume", 0)) >= MIN_VOLUME
     ]
+
     pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return [p["symbol"] for p in pairs[:MAX_SCAN_SYMBOLS]]
 
@@ -218,19 +232,27 @@ def build_snapshot(symbol, timeframes):
 
 # ============================================================
 # GEMINI PROMPTS
-# (content omitted to keep message short — identical logic)
 # ============================================================
 
 def prompt_for_pair(symbol, timeframe, snapshot, price):
     return f"""
-You are an expert analyst...
-(keep your previous prompt text here)
+Act as a world-class crypto futures expert...
+(keep your previous full prompt here)
+Current price: {price}
+Snapshot: {json.dumps(snapshot)}
+Timeframe: {timeframe}
+Return clean JSON only.
 """
+
 
 def prompt_for_scan(symbol, snapshot, price):
     return f"""
-You are a fast crypto scanner...
-(keep your previous prompt text here)
+You are an ultra-fast crypto futures scanner...
+(keep your previous full scanner prompt here)
+Symbol: {symbol}
+Price: {price}
+Snapshot: {json.dumps(snapshot)}
+Return JSON only.
 """
 
 
@@ -253,11 +275,10 @@ def extract_json(text):
 
 
 # ============================================================
-# BINGX BALANCE (FIXED FOR py-bingx==0.4)
+# BINGX BALANCE
 # ============================================================
 
 def get_bingx_usdt_balance():
-    """Correct balance endpoint for USDS-M Perp on py-bingx==0.4"""
     try:
         data = bingx.swap_v2_get_balance()
         balances = data.get("data", {}).get("balance", [])
@@ -271,22 +292,26 @@ def get_bingx_usdt_balance():
 
 
 # ============================================================
-# SYMBOL CONVERSION
+# AUTO-TRADE
 # ============================================================
 
 def binance_to_bingx_symbol(symbol):
     return symbol.replace("USDT", "-USDT")
 
 
-# ============================================================
-# AUTO-TRADE EXECUTION
-# ============================================================
-
 def maybe_auto_trade(sig, context):
     global auto_open_positions
 
-    if not bingx:
+    symbol = sig["symbol"]
+
+    if symbol not in SUPPORTED_BINGX:
+        context.bot.send_message(
+            OWNER_CHAT_ID,
+            f"ℹ️ {symbol} is not supported on BingX.\n"
+            f"Using Binance data only. Auto-trade disabled."
+        )
         return
+
     if len(auto_open_positions) >= AUTO_MAX_POSITIONS:
         return
 
@@ -302,7 +327,7 @@ def maybe_auto_trade(sig, context):
     total_notional = balance * AUTO_LEVERAGE
     qty = (total_notional / AUTO_MAX_POSITIONS) / entry
 
-    bingx_symbol = binance_to_bingx_symbol(sig["symbol"])
+    bingx_symbol = binance_to_bingx_symbol(symbol)
     side = "LONG" if sig["direction"] == "long" else "SHORT"
 
     try:
@@ -314,12 +339,14 @@ def maybe_auto_trade(sig, context):
             sl=str(sig["sl"])
         )
 
-        auto_open_positions.add(sig["symbol"])
+        auto_open_positions.add(symbol)
 
         context.bot.send_message(
             OWNER_CHAT_ID,
             f"✅ AutoTrade Executed\n"
-            f"Symbol: {bingx_symbol}\nSide: {side}\nQty: {qty:.6f}\n"
+            f"Symbol: {bingx_symbol}\n"
+            f"Side: {side}\n"
+            f"Qty: {qty:.6f}\n"
             f"Entry: {entry}\nSL: {sig['sl']}\nTP1: {sig['tp1']}"
         )
 
@@ -328,13 +355,13 @@ def maybe_auto_trade(sig, context):
 
 
 # ============================================================
-# ANALYSIS HANDLERS
+# ANALYSIS
 # ============================================================
 
 def analyze_command(symbol, timeframe):
     tfs = [timeframe] if timeframe else DEFAULT_TIMEFRAMES
-    snapshot, price = build_snapshot(symbol, tfs)
 
+    snapshot, price = build_snapshot(symbol, tfs)
     if price is None:
         return f"❌ Could not fetch candles for {symbol}"
 
@@ -344,7 +371,12 @@ def analyze_command(symbol, timeframe):
     if not data:
         return "❌ JSON parsing error.\n" + raw[:800]
 
+    warn = ""
+    if symbol not in SUPPORTED_BINGX:
+        warn = f"ℹ️ {symbol} is not supported on BingX.\nUsing Binance data only. Auto-trade disabled.\n\n"
+
     result = [
+        warn +
         f"📊 *{symbol} Analysis*",
         f"Price: `{price}`",
         f"Direction: *{data.get('direction')}*",
@@ -354,24 +386,24 @@ def analyze_command(symbol, timeframe):
     ]
 
     if data.get("entry"):
-        result.append("")
-        result.append(f"Entry: `{data['entry']}`")
-        result.append(f"SL: `{data['sl']}`")
-        result.append(f"TP1: `{data['tp1']}`")
-        result.append(f"TP2: `{data.get('tp2')}`")
+        result.extend([
+            "",
+            f"Entry: `{data['entry']}`",
+            f"SL: `{data['sl']}`",
+            f"TP1: `{data['tp1']}`",
+            f"TP2: `{data.get('tp2')}`",
+        ])
 
     return "\n".join(result)
 
 
 def analyze_scan(symbol):
     snapshot, price = build_snapshot(symbol, SCAN_TIMEFRAMES)
-
     if price is None:
         return None
 
     raw = call_gemini(prompt_for_scan(symbol, snapshot, price), GEMINI_MODEL_SCANNER)
     data = extract_json(raw)
-
     if not data:
         return None
 
@@ -394,7 +426,7 @@ def analyze_scan(symbol):
 
 
 # ============================================================
-# TELEGRAM COMMAND HANDLERS
+# TELEGRAM HANDLERS
 # ============================================================
 
 def start(update, context):
@@ -458,8 +490,13 @@ def scanner_job(context):
 
         last_signal_time[key] = now
 
+        warn = ""
+        if sym not in SUPPORTED_BINGX:
+            warn = f"ℹ️ {sym} is not supported on BingX.\nUsing Binance data only. Auto-trade disabled.\n\n"
+
         context.bot.send_message(
             OWNER_CHAT_ID,
+            warn +
             f"🚨 *AI SIGNAL*\n"
             f"Symbol: `{sym}`\n"
             f"Direction: `{sig['direction']}`\n"
@@ -479,6 +516,8 @@ def scanner_job(context):
 # ============================================================
 
 def main():
+    load_supported_bingx_symbols()
+
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 

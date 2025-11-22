@@ -13,6 +13,10 @@ from telegram.ext import (
     CallbackContext,
 )
 
+# BingX wrapper
+from bingx.api import BingxAPI  # from py-bingx
+
+
 # ===============================
 # ENVIRONMENT VARIABLES
 # ===============================
@@ -21,28 +25,33 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 
+BINGX_API_KEY = os.getenv("BINGX_API_KEY")
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET")
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY missing")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL_MANUAL = "gemini-2.5-flash"
+GEMINI_MODEL_SCANNER = "gemini-2.5-flash"  # you can change to cheaper model later
 
 # ===============================
 # STRATEGY SETTINGS
 # ===============================
 
-# Auto scanner toggle (controlled by /start and /stop)
-SCAN_ENABLED = True
+SCAN_ENABLED = True  # controlled by /start and /stop
 
-# Scanner & filter settings
-SCAN_INTERVAL_SECONDS = 300       # 5 minutes
-MIN_VOLUME = 50_000_000           # 24h quote volume filter (>= 50M)
+SCAN_INTERVAL_SECONDS = 300        # 5 minutes
+MIN_VOLUME = 50_000_000            # 24h quote volume filter (>= 50M)
 MAX_SCAN_SYMBOLS = 25
-MIN_PROBABILITY_FOR_TRADE = 75    # min upside/downside probability (in %)
 
-# NEW: required RR for both manual and auto signals
-MIN_RR = 2.1                      # minimum RR 1 : 2.1
+# probability thresholds
+MIN_PROB_MANUAL = 75               # for manual /pair analysis
+MIN_PROB_SCAN = 85                 # for auto-scan + auto-trade
+
+# RR constraints
+MIN_RR = 2.1                       # minimum RR 1:2.1
 
 DEFAULT_TIMEFRAMES = [
     "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"
@@ -51,11 +60,20 @@ SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
 
 BINANCE_FAPI = "https://fapi.binance.com"
 
-# Throttle repeated signals
-last_signal_time = {}  # (symbol, direction) -> datetime
+# auto-trading controls
+AUTO_MAX_POSITIONS = 2          # max auto positions at once
+AUTO_LEVERAGE = 3.0             # use 3x notional vs equity
+
+last_signal_time = {}           # (symbol, direction) -> datetime
+auto_open_positions = set()     # track symbols where bot opened a position
 
 # Gemini client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# BingX client (can be None if no keys)
+bingx = None
+if BINGX_API_KEY and BINGX_API_SECRET:
+    bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET, timestamp="local")
 
 
 # ===============================
@@ -63,7 +81,6 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # ===============================
 
 def get_klines(symbol, interval, limit=120):
-    """Fetch OHLCV data from Binance USDT-M Futures."""
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
@@ -72,7 +89,6 @@ def get_klines(symbol, interval, limit=120):
 
 
 def get_top_symbols():
-    """Return high-volume USDT-M futures symbols filtered by MIN_VOLUME."""
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
@@ -88,7 +104,6 @@ def get_top_symbols():
 
 
 def build_snapshot(symbol, timeframes):
-    """Build OHLCV snapshot dict + current price for given timeframes."""
     snapshot = {}
     current_price = None
 
@@ -118,11 +133,6 @@ def build_snapshot(symbol, timeframes):
 # ===============================
 
 def prompt_for_pair(symbol, timeframe, snapshot, price):
-    """
-    Prompt for manual /pair analysis.
-    RR must be >= MIN_RR (2.1) and TP targets should be realistic in relation
-    to the upside/downside probability.
-    """
     return f"""
 You are an elite crypto futures analyst and trader.
 
@@ -134,30 +144,23 @@ OHLCV JSON:
 {json.dumps(snapshot)[:80000]}
 
 MAIN ANALYSIS RULES:
-- Base your view mainly on PRICE ACTION and MARKET STRUCTURE:
-  - Overall trend (uptrend / downtrend / range) on each timeframe.
-  - Important support/resistance zones.
-  - Trendlines and channels, breakouts or retests.
+- Focus on PRICE ACTION + MARKET STRUCTURE:
+  - Trend (up / down / range) on each TF.
+  - Major support/resistance & supply-demand zones.
+  - Trendlines / channels, breakouts & retests.
   - Reversal candles (hammer, shooting star, engulfing, pin bars) at key levels.
-  - Chart patterns (triangles, flags, head & shoulders, double top/bottom, etc.).
-
+  - Patterns (triangles, flags, head & shoulders, double tops/bottoms, etc.).
 - Use a FIXED RANGE VOLUME PROFILE mental model:
-  - Identify high-volume nodes (HVN) and low-volume nodes (LVN) within this range.
-  - STOP LOSS must sit at a logical structural invalidation level:
-    just beyond a key HVN/LVN or clear swing high/low.
-  - SL must NOT be random and NOT extremely tight.
+  - SL must sit beyond a clear invalidation level (HVN/LVN or swing high/low).
+- Use EMAs (20/50/200), RSI, MACD, volume only as confirmation.
 
-- Use EMAs (20, 50, 200), RSI, MACD and volume as confirmation only.
-
-- TAKE PROFIT LOGIC:
-  - RR (risk:reward) for the main idea must be at least {MIN_RR} (1:{MIN_RR}).
-  - TP1 should be a realistic, high-probability target consistent with the
-    upside/downside probability you give.
-  - TP2 can be more ambitious but still logically reachable based on structure,
-    trend and volume profile (not crazy far away).
+TAKE PROFIT / RISK:
+- Risk:Reward rr_ratio must be >= {MIN_RR} (1:{MIN_RR}).
+- TP1 must be realistic and consistent with the upside/downside probability.
+- TP2 can be more ambitious but still logically reachable.
 
 TASK:
-1. Determine probabilities (0-100) of the next meaningful move:
+1. Estimate probabilities (0-100):
    - upside
    - downside
    - flat
@@ -166,22 +169,14 @@ TASK:
 
 3. ONLY IF:
    - best_direction is upside or downside, AND
-   - its probability >= {MIN_PROBABILITY_FOR_TRADE}, AND
+   - its probability >= {MIN_PROB_MANUAL}, AND
    - a clean setup with rr_ratio >= {MIN_RR} exists,
-   THEN generate a detailed trade plan:
-   - direction (long/short)
-   - entry (single entry price)
-   - stop_loss (key level invalidation as above)
-   - take_profit_1 (realistic target matching the probability)
-   - take_profit_2 (more ambitious but still logical)
-   - rr_ratio (>= {MIN_RR})
-   - leverage_hint (safe range like 2x-4x)
-   - confidence (0-100)
-   - reasoning (short explanation referencing structure & volume profile)
+   THEN produce a trade plan with direction, entry, stop_loss, take_profit_1, take_profit_2,
+   rr_ratio, leverage_hint, confidence and reasoning.
 
-4. If conditions are NOT met, set direction="none" and rr_ratio=0.
+4. Otherwise, direction="none" and rr_ratio=0.
 
-Return ONLY valid JSON with this schema:
+Return ONLY JSON:
 
 {{
   "symbol": "{symbol}",
@@ -208,12 +203,8 @@ Return ONLY valid JSON with this schema:
 
 
 def prompt_for_scan(symbol, snapshot, price):
-    """
-    Prompt for fast scanner.
-    RR must be >= MIN_RR and probability >= MIN_PROBABILITY_FOR_TRADE.
-    """
     return f"""
-Quick scan of crypto futures pair:
+Quick scanner for crypto futures pair:
 
 Symbol: {symbol}
 Price: {price}
@@ -222,16 +213,15 @@ OHLCV JSON:
 {json.dumps(snapshot)[:60000]}
 
 RULES:
-- Use price action + structure (trend, key levels, breakouts, reversals).
-- Use a fixed range volume profile mental model for SL positioning at a
-  structural invalidation level (beyond key HVN/LVN or swing high/low).
-- Only accept setups where:
-  - best_direction is upside or downside,
-  - the probability of that move >= {MIN_PROBABILITY_FOR_TRADE}%, and
-  - risk:reward rr_ratio >= {MIN_RR} (1:{MIN_RR} or better).
+- Use price action, trend, key levels, breakouts, reversals.
+- Use a fixed range volume profile mental model for SL (beyond invalidation level).
+- You must strictly enforce:
+  - best_direction is upside or downside (not flat),
+  - probability of that move >= {MIN_PROB_SCAN}%, and
+  - rr_ratio >= {MIN_RR} (1:{MIN_RR} or better).
 
-- TP1 must be a realistic, high-probability target consistent with the
-  given move probability. TP2 can be more ambitious but still logical.
+- TP1 must be realistic and match the move probability.
+- TP2 can be more ambitious but still logical.
 
 Return ONLY JSON:
 
@@ -260,9 +250,9 @@ Return ONLY JSON:
 # GEMINI CALL + JSON PARSE
 # ===============================
 
-def call_gemini(prompt: str) -> str:
+def call_gemini(prompt: str, model: str) -> str:
     resp = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=model,
         contents=prompt,
     )
     return resp.text
@@ -278,11 +268,10 @@ def extract_json(text: str):
 
 
 # ===============================
-# ANALYSIS FUNCTIONS
+# ANALYSIS FUNCTIONS (MANUAL)
 # ===============================
 
 def analyze_command(symbol: str, timeframe: str | None):
-    """Analysis for manual /pair and /pair timeframe commands."""
     tfs = [timeframe] if timeframe else DEFAULT_TIMEFRAMES
     snapshot, price = build_snapshot(symbol, tfs)
 
@@ -290,7 +279,7 @@ def analyze_command(symbol: str, timeframe: str | None):
         return f"❌ Could not fetch market data for *{symbol}*."
 
     prompt = prompt_for_pair(symbol, timeframe, snapshot, price)
-    raw = call_gemini(prompt)
+    raw = call_gemini(prompt, GEMINI_MODEL_MANUAL)
     data = extract_json(raw)
 
     if not data:
@@ -307,7 +296,7 @@ def analyze_command(symbol: str, timeframe: str | None):
     direction = tp.get("direction", "none")
     rr_ratio = float(tp.get("rr_ratio", 0) or 0.0)
 
-    # Enforce RR threshold for manual analysis too
+    # Enforce RR threshold for manual proposals too
     if rr_ratio < MIN_RR:
         direction = "none"
 
@@ -339,7 +328,7 @@ def analyze_command(symbol: str, timeframe: str | None):
             lines.append(f"Reason: {tp['reasoning']}")
     else:
         lines.append(
-            f"🚫 No strong setup (probability < {MIN_PROBABILITY_FOR_TRADE}% "
+            f"🚫 No strong setup (probability < {MIN_PROB_MANUAL}% "
             f"or RR < {MIN_RR})."
         )
 
@@ -347,14 +336,17 @@ def analyze_command(symbol: str, timeframe: str | None):
     return "\n".join(lines)
 
 
+# ===============================
+# ANALYSIS FOR SCANNER
+# ===============================
+
 def analyze_scan(symbol: str):
-    """Return a compact signal dict for scanner, or None if no setup."""
     snapshot, price = build_snapshot(symbol, SCAN_TIMEFRAMES)
     if price is None:
         return None
 
     prompt = prompt_for_scan(symbol, snapshot, price)
-    raw = call_gemini(prompt)
+    raw = call_gemini(prompt, GEMINI_MODEL_SCANNER)
     data = extract_json(raw)
     if not data:
         return None
@@ -373,7 +365,7 @@ def analyze_scan(symbol: str):
         return None
 
     prob = up if best == "upside" else down
-    if prob < MIN_PROBABILITY_FOR_TRADE:
+    if prob < MIN_PROB_SCAN:
         return None
     if rr_ratio < MIN_RR:
         return None
@@ -382,13 +374,163 @@ def analyze_scan(symbol: str):
         "symbol": symbol,
         "direction": direction,
         "probability": prob,
-        "entry": tp.get("entry", 0),
-        "sl": tp.get("stop_loss", 0),
-        "tp1": tp.get("take_profit_1", 0),
-        "tp2": tp.get("take_profit_2", 0),
+        "entry": float(tp.get("entry", 0) or 0.0),
+        "sl": float(tp.get("stop_loss", 0) or 0.0),
+        "tp1": float(tp.get("take_profit_1", 0) or 0.0),
+        "tp2": float(tp.get("take_profit_2", 0) or 0.0),
         "rr": rr_ratio,
-        "confidence": tp.get("confidence", prob),
+        "confidence": float(tp.get("confidence", prob) or prob),
     }
+
+
+# ===============================
+# BINGX HELPERS (AUTO-TRADE)
+# ===============================
+
+def binance_to_bingx_symbol(symbol: str) -> str:
+    # BTCUSDT -> BTC-USDT, SUIUSDT -> SUI-USDT, etc.
+    if symbol.endswith("USDT"):
+        return symbol[:-4] + "-USDT"
+    return symbol
+
+
+def get_bingx_usdt_balance():
+    """
+    Try to read available USDT balance from BingX perpetual account.
+
+    NOTE: py-bingx returns a dict/list depending on version.
+    If this fails, check logs and adjust parsing.
+    """
+    if not bingx:
+        return None
+
+    info = bingx.get_perpetual_balance()
+    usdt_balance = None
+
+    def extract_from_obj(obj):
+        for key in ["availableBalance", "available", "balance"]:
+            if key in obj:
+                try:
+                    return float(obj[key])
+                except Exception:
+                    continue
+        return None
+
+    try:
+        # common patterns
+        if isinstance(info, dict):
+            if "data" in info and isinstance(info["data"], list):
+                for item in info["data"]:
+                    if str(item.get("asset", "")).upper() == "USDT":
+                        bal = extract_from_obj(item)
+                        if bal is not None:
+                            return bal
+            bal = extract_from_obj(info)
+            if bal is not None:
+                return bal
+
+        if isinstance(info, list):
+            for item in info:
+                if str(item.get("asset", "")).upper() == "USDT":
+                    bal = extract_from_obj(item)
+                    if bal is not None:
+                        return bal
+    except Exception:
+        return None
+
+    return usdt_balance
+
+
+def maybe_auto_trade(sig: dict, context: CallbackContext):
+    """
+    Auto-trade on BingX if:
+    - bingx client available
+    - less than AUTO_MAX_POSITIONS currently open (tracked by bot)
+    Uses 100% balance * AUTO_LEVERAGE, split equally across AUTO_MAX_POSITIONS slots.
+    """
+    global auto_open_positions
+
+    if not bingx or OWNER_CHAT_ID == 0:
+        return
+
+    # soft limit by bot tracking (doesn't know about manual closes)
+    if len(auto_open_positions) >= AUTO_MAX_POSITIONS:
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text="⚠️ Auto-trade skipped for "
+                 f"{sig['symbol']} — max auto positions reached.",
+        )
+        return
+
+    balance = get_bingx_usdt_balance()
+    if balance is None or balance <= 0:
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text="⚠️ Auto-trade skipped: could not read BingX USDT balance "
+                 "or balance is zero.",
+        )
+        return
+
+    entry = sig["entry"]
+    if entry <= 0:
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"⚠️ Auto-trade skipped for {sig['symbol']}: invalid entry.",
+        )
+        return
+
+    # total notional = equity * leverage; split into equal slots for 2 positions
+    total_notional = balance * AUTO_LEVERAGE
+    per_position_notional = total_notional / AUTO_MAX_POSITIONS
+    qty = per_position_notional / entry
+
+    if qty <= 0:
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"⚠️ Auto-trade skipped for {sig['symbol']}: qty <= 0.",
+        )
+        return
+
+    bingx_symbol = binance_to_bingx_symbol(sig["symbol"])
+    side = "LONG" if sig["direction"].lower() == "long" else "SHORT"
+
+    qty_str = f"{qty:.8f}"  # you can fine-tune precision per pair
+    tp_price = sig["tp1"]
+    sl_price = sig["sl"]
+
+    try:
+        order_data = bingx.open_market_order(
+            bingx_symbol,
+            side,
+            qty_str,
+            tp=str(tp_price),
+            sl=str(sl_price),
+        )
+        auto_open_positions.add(sig["symbol"])
+
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=(
+                "✅ *Auto-trade executed on BingX*\n"
+                f"Pair: *{bingx_symbol}* ({sig['symbol']})\n"
+                f"Side: *{side}*\n"
+                f"Entry (signal): `{entry}`\n"
+                f"SL: `{sl_price}`\n"
+                f"TP1 (linked to order): `{tp_price}`\n"
+                f"Risk:Reward: `{sig['rr']}`\n"
+                f"Used balance: ~`100%` at `{AUTO_LEVERAGE}x` "
+                f"(split for {AUTO_MAX_POSITIONS} slots)\n\n"
+                "_Check BingX to confirm exact fills and fees._"
+            ),
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"❌ Auto-trade failed for {bingx_symbol}: `{e}`",
+            parse_mode="Markdown",
+        )
 
 
 # ===============================
@@ -396,12 +538,11 @@ def analyze_scan(symbol: str):
 # ===============================
 
 def start(update: Update, context: CallbackContext):
-    """Enable scanner and show basic help."""
     global SCAN_ENABLED
     SCAN_ENABLED = True
 
     text = (
-        "🤖 *Gemini 2.5 Futures Bot*\n\n"
+        "🤖 *Gemini 2.5 Futures Bot + BingX Auto-Trade*\n\n"
         "Scanner is now: *ON* ✅\n\n"
         "Commands:\n"
         "• `/coin` → Multi-timeframe AI analysis (e.g. `/suiusdt`)\n"
@@ -410,14 +551,18 @@ def start(update: Update, context: CallbackContext):
         "• `/start` → Turn auto scanner ON again\n\n"
         "Scanner rules:\n"
         f"• Scans Binance USDT-M futures with 24h vol ≥ {MIN_VOLUME:,} USDT\n"
-        f"• Signals only if upside/downside prob ≥ {MIN_PROBABILITY_FOR_TRADE}%\n"
-        f"• Trade RR must be ≥ 1:{MIN_RR} and SL at strong structural/volume-profile levels."
+        f"• Signals only if upside/downside prob ≥ {MIN_PROB_SCAN}%\n"
+        f"• Trade RR must be ≥ 1:{MIN_RR}\n\n"
+        "Auto-Trade (BingX):\n"
+        f"• Uses *100%* of USDT balance at *{AUTO_LEVERAGE}x*\n"
+        f"• Max *{AUTO_MAX_POSITIONS}* open auto positions at a time\n"
+        "• For 2 positions, notional is split equally.\n\n"
+        "_HIGH RISK: Always monitor your account. This is NOT financial advice._"
     )
     update.message.reply_markdown(text)
 
 
 def stop(update: Update, context: CallbackContext):
-    """Disable scanner only; manual commands still work."""
     global SCAN_ENABLED
     SCAN_ENABLED = False
     update.message.reply_text(
@@ -428,7 +573,6 @@ def stop(update: Update, context: CallbackContext):
 
 
 def handle_pair(update: Update, context: CallbackContext):
-    """Handle any /coin or /coin timeframe command."""
     if not update.message or not update.message.text:
         return
 
@@ -457,10 +601,8 @@ def handle_pair(update: Update, context: CallbackContext):
 # ===============================
 
 def scanner_job(context: CallbackContext):
-    """Runs every 5 minutes via JobQueue, if SCAN_ENABLED."""
     if OWNER_CHAT_ID == 0:
         return
-
     if not SCAN_ENABLED:
         return
 
@@ -491,14 +633,14 @@ def scanner_job(context: CallbackContext):
             "🚨 *AI Scanner Signal*\n"
             f"Pair: *{sym}*\n"
             f"Direction: *{sig['direction'].upper()}*\n"
-            f"Probability: `{sig['probability']}%`\n"
+            f"Probability: `{sig['probability']}%` (≥ {MIN_PROB_SCAN}%)\n"
             f"RR: `{sig['rr']}` (≥ {MIN_RR})\n"
             f"Entry: `{sig['entry']}`\n"
             f"SL (key level): `{sig['sl']}`\n"
             f"TP1: `{sig['tp1']}`\n"
             f"TP2: `{sig['tp2']}`\n"
             f"Confidence: `{sig['confidence']}%`\n\n"
-            "_Use your own position sizing & risk control._"
+            "_Signal is generated via Gemini AI. Use your own risk management._"
         )
 
         context.bot.send_message(
@@ -506,6 +648,9 @@ def scanner_job(context: CallbackContext):
             text=msg,
             parse_mode="Markdown",
         )
+
+        # try to auto-trade this signal on BingX
+        maybe_auto_trade(sig, context)
 
 
 # ===============================
@@ -520,13 +665,13 @@ def main():
     dp.add_handler(CommandHandler("help", start))
     dp.add_handler(CommandHandler("stop", stop))
 
-    # Catch all /coin commands such as /suiusdt or /btcusdt 4h
+    # any /COIN or /COIN timeframe
     dp.add_handler(MessageHandler(Filters.command, handle_pair))
 
     jq = updater.job_queue
     jq.run_repeating(scanner_job, interval=SCAN_INTERVAL_SECONDS, first=30)
 
-    print("✅ Bot running with polling + scanner (PTB v13.15)...")
+    print("✅ Bot running with polling + scanner + BingX auto-trade (PTB v13.15)...")
     updater.start_polling()
     updater.idle()
 

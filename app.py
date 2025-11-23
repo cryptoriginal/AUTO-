@@ -61,7 +61,10 @@ AUTO_LEVERAGE = 3.0
 
 last_signal_time = {}
 auto_open_positions = set()
-SUPPORTED_BINGX = set()  # auto-filled
+
+# None = we failed to load list → treat all as “maybe supported”
+# set([...]) = list successfully loaded → we check membership
+SUPPORTED_BINGX = None
 
 
 # ============================================================
@@ -82,14 +85,16 @@ if BINGX_API_KEY and BINGX_API_SECRET:
 def load_supported_bingx_symbols():
     """
     Load all USDT-M perpetual futures from BingX.
-    If something fails, SUPPORTED_BINGX stays empty,
-    and we treat all symbols as supported (no warning).
+
+    If this fails, we set SUPPORTED_BINGX = None
+    which means: do NOT warn about unsupported, just TRY trading and
+    let BingX respond if symbol really doesn't exist.
     """
     global SUPPORTED_BINGX
 
     if not bingx:
-        print("No BingX client; skipping symbol load.")
-        SUPPORTED_BINGX = set()
+        print("No BingX client; skipping contract load.")
+        SUPPORTED_BINGX = None
         return
 
     try:
@@ -99,33 +104,89 @@ def load_supported_bingx_symbols():
 
         for c in contracts:
             sym = c.get("symbol", "")
-            # Typical format: BTC-USDT -> convert to BTCUSDT
-            if "-USDT" in sym:
+            # Typical futures format: BTC-USDT
+            if sym.endswith("-USDT"):
                 symbols.add(sym.replace("-USDT", "USDT"))
 
         SUPPORTED_BINGX = symbols
-        print(f"Loaded {len(SUPPORTED_BINGX)} BingX USDT-M symbols.")
+        print(f"Loaded {len(SUPPORTED_BINGX)} BingX USDT-M futures symbols.")
     except Exception as e:
-        print("Failed to load BingX contracts, treating all symbols as supported:", e)
-        SUPPORTED_BINGX = set()  # empty = "no info, don't warn"
+        print("Failed to load BingX contracts:", e)
+        SUPPORTED_BINGX = None  # no info, no warnings
 
 
 # ============================================================
-# MARKET DATA: ONLY BINGX FOR CANDLES
+# MARKET DATA (TRIPLE FALLBACK)
 # ============================================================
 
-def fetch_bingx_klines(symbol, interval, limit=100):
+BINANCE_ENDPOINTS = [
+    "https://fapi.binancevip.com",
+    "https://api2.binance.com"
+]
+
+OKX_ENDPOINT = "https://www.okx.com"
+
+
+def fetch_binance(path, params=None):
     """
-    Use ONLY BingX for candlestick data.
-    Binance/OKX are NOT used for klines anymore.
+    Binance with retries. Used for klines and 24h ticker.
+    """
+    params = params or {}
+    for endpoint in BINANCE_ENDPOINTS:
+        url = endpoint + path
+
+        for attempt in range(3):
+            try:
+                r = requests.get(url, params=params, timeout=10)
+
+                if r.status_code in [418, 429, 451, 403] or r.status_code >= 500:
+                    time.sleep(1.2 * (attempt + 1))
+                    continue
+
+                r.raise_for_status()
+                return r.json()
+            except Exception:
+                time.sleep(1.2 * (attempt + 1))
+
+    raise RuntimeError("Binance failed in all attempts.")
+
+
+def fetch_okx(symbol, interval):
+    """
+    OKX futures candles: ETHUSDT → ETH-USDT-SWAP
+    """
+    try:
+        okx_symbol = symbol.replace("USDT", "-USDT-SWAP")
+        url = f"{OKX_ENDPOINT}/api/v5/market/candles"
+        r = requests.get(url, params={"instId": okx_symbol, "bar": interval}, timeout=10)
+        r.raise_for_status()
+        raw = r.json()
+
+        candles = [{
+            "open_time": c[0],
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        } for c in raw.get("data", [])]
+
+        return candles if candles else None
+    except Exception as e:
+        print(f"fetch_okx error {symbol} {interval}:", e)
+        return None
+
+
+def fetch_bingx(symbol, interval):
+    """
+    BingX futures candles: ETHUSDT → ETH-USDT
     """
     if not bingx:
-        return []
+        return None
 
     try:
-        # Convert BTCUSDT -> BTC-USDT
         bingx_symbol = symbol.replace("USDT", "-USDT")
-        data = bingx.market_get_candles(bingx_symbol, interval, limit)
+        data = bingx.market_get_candles(bingx_symbol, interval, 100)
 
         candles = [{
             "open_time": c["t"],
@@ -136,52 +197,60 @@ def fetch_bingx_klines(symbol, interval, limit=100):
             "volume": float(c["v"]),
         } for c in data.get("data", [])]
 
-        return candles
+        return candles if candles else None
     except Exception as e:
-        print(f"fetch_bingx_klines error for {symbol} {interval}: {e}")
-        return []
+        print(f"fetch_bingx error {symbol} {interval}:", e)
+        return None
 
 
 def get_klines(symbol, interval):
     """
-    Master candle function now using ONLY BingX data.
+    Master candle function:
+    1) BingX
+    2) OKX
+    3) Binance
     """
-    return fetch_bingx_klines(symbol, interval)
+    # 1️⃣ BingX
+    c = fetch_bingx(symbol, interval)
+    if c:
+        return c
+
+    # 2️⃣ OKX
+    c = fetch_okx(symbol, interval)
+    if c:
+        return c
+
+    # 3️⃣ Binance
+    try:
+        raw = fetch_binance("/fapi/v1/klines", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": 100,
+        })
+    except Exception as e:
+        print(f"fetch_binance klines error {symbol} {interval}:", e)
+        return None
+
+    candles = [{
+        "open_time": c[0],
+        "open": float(c[1]),
+        "high": float(c[2]),
+        "low": float(c[3]),
+        "close": float(c[4]),
+        "volume": float(c[5]),
+    } for c in raw]
+
+    return candles if candles else None
 
 
 # ============================================================
-# TOP SYMBOLS FOR SCANNER
-# (still using Binance 24h volume, but ONLY for ranking)
+# TOP SYMBOLS FOR SCANNER (BINANCE 24H VOL)
 # ============================================================
-
-BINANCE_ENDPOINTS = [
-    "https://fapi.binancevip.com",
-    "https://api2.binance.com"
-]
-
-def fetch_binance(path, params=None):
-    params = params or {}
-    for endpoint in BINANCE_ENDPOINTS:
-        url = endpoint + path
-        for attempt in range(3):
-            try:
-                r = requests.get(url, params=params, timeout=10)
-                if r.status_code in [418, 429, 451, 403] or r.status_code >= 500:
-                    time.sleep(1.2 * (attempt + 1))
-                    continue
-                r.raise_for_status()
-                return r.json()
-            except Exception:
-                time.sleep(1.2 * (attempt + 1))
-    # If Binance fails, scanner will just skip
-    raise RuntimeError("Binance 24h ticker failed in all attempts.")
-
 
 def get_top_symbols():
     """
-    Use Binance 24h ticker ONLY to rank symbols by volume.
-    Scanner will still use BingX for candles,
-    and auto-trade only BingX-supported pairs.
+    Use Binance 24h ticker just to pick high-volume pairs.
+    Scanner & trades still use BingX/OKX/Binance candles above.
     """
     try:
         data = fetch_binance("/fapi/v1/ticker/24hr")
@@ -196,11 +265,10 @@ def get_top_symbols():
     ]
 
     pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-
     symbols = [p["symbol"] for p in pairs[:MAX_SCAN_SYMBOLS]]
 
-    # If we have a BingX supported list, filter to those
-    if SUPPORTED_BINGX:
+    # If we successfully loaded a BingX list, filter to those for scanning
+    if SUPPORTED_BINGX is not None:
         symbols = [s for s in symbols if s in SUPPORTED_BINGX]
 
     return symbols
@@ -215,7 +283,12 @@ def build_snapshot(symbol, timeframes):
     current_price = None
 
     for tf in timeframes:
-        klines = get_klines(symbol, tf)
+        try:
+            klines = get_klines(symbol, tf)
+        except Exception as e:
+            print(f"get_klines error {symbol} {tf}:", e)
+            klines = None
+
         snapshot[tf] = klines
         if klines:
             current_price = klines[-1]["close"]
@@ -230,18 +303,17 @@ def build_snapshot(symbol, timeframes):
 def prompt_for_pair(symbol, timeframe, snapshot, price):
     return f"""
 You are a world-class crypto futures analyst with deep knowledge of:
-- Price action, key levels, liquidity, trendlines, chart patterns
-- RSI / MACD / EMAs for confirmation
+- Price action, liquidity, key levels, trendlines, chart patterns
+- RSI / MACD / EMAs as confirmation
 - Reversal candles (hammer, doji, engulfing, pin-bars)
 
-You will analyse the given symbol using the multi-timeframe snapshot
-and return probabilities and an actionable trade plan.
+You analyse the given symbol using the multi-timeframe snapshot
+and output strict JSON with:
 
-Return STRICT JSON with keys:
 - upside_probability
 - downside_probability
 - flat_probability
-- direction  (\"long\" | \"short\" | \"flat\")
+- direction  ("long" | "short" | "flat")
 - entry
 - sl
 - tp1
@@ -249,10 +321,10 @@ Return STRICT JSON with keys:
 - rr   (risk:reward)
 
 Rules:
-- rr must be >= 1.8 if you give a trade.
-- SL must be at a real key level / liquidity area (not random).
+- rr must be >= 1.8 if you propose a trade.
+- SL must be at a real key level / liquidity area, not random.
 - Use price action first, indicators only as confirmation.
-- If market is choppy/unclear, increase flat_probability.
+- If market is choppy / unclear, increase flat_probability.
 
 symbol: {symbol}
 requested_timeframe: {timeframe}
@@ -265,11 +337,12 @@ Return ONLY JSON, no explanation.
 def prompt_for_scan(symbol, snapshot, price):
     return f"""
 You are an ultra-fast crypto futures scanner.
-You scan the symbol and decide if there is a high probability trade
-(upside or downside) based on the snapshot.
 
-Return STRICT JSON with keys:
-- direction  (\"long\" | \"short\")
+You scan the symbol and decide if there is a high probability trade
+(upside or downside) based on this snapshot.
+
+Return strict JSON with:
+- direction  ("long" | "short")
 - probability  (0-100)
 - entry
 - sl
@@ -279,9 +352,9 @@ Return STRICT JSON with keys:
 
 Rules:
 - Only give a trade if probability >= {MIN_PROB_SCAN} and rr >= {MIN_RR}.
-- SL must be at a logical key level.
+- SL must be at a logical key level, not random.
 - Entry can be near current price or slight pullback.
-- Prefer clean RR structure (1:2.1 or better).
+- Prefer clean RR structure.
 
 symbol: {symbol}
 current_price: {price}
@@ -346,12 +419,12 @@ def maybe_auto_trade(sig, context: CallbackContext):
 
     symbol = sig["symbol"]
 
-    # Only show unsupported warning if we actually have a list
-    if SUPPORTED_BINGX and symbol not in SUPPORTED_BINGX:
+    # Only warn if we actually have a contract list
+    if SUPPORTED_BINGX is not None and symbol not in SUPPORTED_BINGX:
         context.bot.send_message(
             OWNER_CHAT_ID,
-            f"ℹ️ {symbol} is not in BingX futures contracts list.\n"
-            f"Using analysis only. Auto-trade disabled."
+            f"ℹ️ {symbol} not found in BingX futures contracts list.\n"
+            f"Analysis only, auto-trade disabled."
         )
         return
 
@@ -403,7 +476,7 @@ def maybe_auto_trade(sig, context: CallbackContext):
 
 
 # ============================================================
-# ANALYSIS + SCANNER LOGIC
+# ANALYSIS & SCANNER
 # ============================================================
 
 def analyze_command(symbol, timeframe):
@@ -411,7 +484,7 @@ def analyze_command(symbol, timeframe):
 
     snapshot, price = build_snapshot(symbol, tfs)
     if price is None:
-        return f"❌ Could not fetch candles for {symbol} from BingX."
+        return f"❌ Could not fetch candles for {symbol} from any exchange."
 
     raw = call_gemini(
         prompt_for_pair(symbol, timeframe, snapshot, price),
@@ -423,9 +496,9 @@ def analyze_command(symbol, timeframe):
         return "❌ JSON parsing error from AI.\n" + raw[:500]
 
     warn = ""
-    if SUPPORTED_BINGX and symbol not in SUPPORTED_BINGX:
+    if SUPPORTED_BINGX is not None and symbol not in SUPPORTED_BINGX:
         warn = (
-            f"ℹ️ {symbol} not found in BingX futures contracts.\n"
+            f"ℹ️ {symbol} not in BingX futures contracts list.\n"
             f"Analysis only, auto-trade disabled.\n\n"
         )
 
@@ -439,15 +512,13 @@ def analyze_command(symbol, timeframe):
     ]
 
     if data.get("entry"):
-        result.extend(
-            [
-                "",
-                f"Entry: `{data['entry']}`",
-                f"SL: `{data['sl']}`",
-                f"TP1: `{data['tp1']}`",
-                f"TP2: `{data.get('tp2')}`",
-            ]
-        )
+        result.extend([
+            "",
+            f"Entry: `{data['entry']}`",
+            f"SL: `{data['sl']}`",
+            f"TP1: `{data['tp1']}`",
+            f"TP2: `{data.get('tp2')}`",
+        ])
 
     return "\n".join(result)
 
@@ -507,7 +578,7 @@ def handle_pair(update, context: CallbackContext):
     symbol = parts[0].replace("/", "").upper()
     timeframe = parts[1] if len(parts) > 1 else None
 
-    update.message.reply_text(f"⏳ Analysing {symbol} (BingX data)...")
+    update.message.reply_text(f"⏳ Analysing {symbol}...")
 
     try:
         result = analyze_command(symbol, timeframe)
@@ -553,9 +624,9 @@ def scanner_job(context: CallbackContext):
         last_signal_time[key] = now
 
         warn = ""
-        if SUPPORTED_BINGX and sym not in SUPPORTED_BINGX:
+        if SUPPORTED_BINGX is not None and sym not in SUPPORTED_BINGX:
             warn = (
-                f"ℹ️ {sym} not found in BingX futures contracts.\n"
+                f"ℹ️ {sym} not in BingX futures contracts list.\n"
                 f"Analysis only, auto-trade disabled.\n\n"
             )
 

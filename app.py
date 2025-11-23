@@ -1,5 +1,5 @@
-# FULL APP.PY — FIXED FOR RENDER + PTB3 + ASYNC SCANNER
-# ------------------------------------------------------
+# FULL APP.PY — RENDER + PTB20 + ASYNC SCANNER (NO JOBQUEUE)
+# -----------------------------------------------------------
 
 import os
 import json
@@ -39,8 +39,8 @@ if not GEMINI_API_KEY:
 
 GEMINI_MODEL = "gemini-1.5-flash"
 
-SCAN_INTERVAL_SECONDS = 300
-SIGNAL_COOLDOWN_SECONDS = 600
+SCAN_INTERVAL_SECONDS = 300          # 5 minutes
+SIGNAL_COOLDOWN_SECONDS = 600        # 10 minutes
 MIN_PROB_SCAN = 80
 MIN_RR = 1.9
 MIN_VOLUME = 50_000_000
@@ -53,6 +53,7 @@ SUPPORTED_BINGX = set()
 auto_open_positions = set()
 last_signal_time = {}
 
+
 # ============================================================
 # CLIENTS
 # ============================================================
@@ -62,6 +63,7 @@ model = genai.GenerativeModel(GEMINI_MODEL)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
+    # Simple init – matches your installed py-bingx
     bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
 
 
@@ -79,52 +81,72 @@ INTERVAL_MAP = {
 
 
 def get_bybit_symbols():
+    """Top linear USDT futures symbols by 24h turnover."""
     try:
-        r = requests.get(f"{BYBIT_ENDPOINT}/v5/market/tickers",
-                         params={"category": "linear"},
-                         timeout=10)
+        r = requests.get(
+            f"{BYBIT_ENDPOINT}/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=10,
+        )
         data = r.json()
-        lst = data.get("result", {}).get("list", [])
-        lst = [x for x in lst if float(x["turnover24h"]) >= MIN_VOLUME]
-        lst.sort(key=lambda x: float(x["turnover24h"]), reverse=True)
+        lst = data.get("result", {}).get("list", []) or []
+        lst = [x for x in lst if float(x.get("turnover24h", "0")) >= MIN_VOLUME]
+        lst.sort(key=lambda x: float(x.get("turnover24h", "0")), reverse=True)
         return [x["symbol"] for x in lst[:20]]
-    except:
+    except Exception as e:
+        print("get_bybit_symbols error:", e)
         return []
 
 
 def get_candles(symbol, tf):
+    """Fetch OHLCV candles from Bybit linear futures."""
     try:
-        r = requests.get(f"{BYBIT_ENDPOINT}/v5/market/kline",
-                         params={"category": "linear", "symbol": symbol, "interval": INTERVAL_MAP[tf], "limit": 200},
-                         timeout=10)
+        r = requests.get(
+            f"{BYBIT_ENDPOINT}/v5/market/kline",
+            params={
+                "category": "linear",
+                "symbol": symbol,
+                "interval": INTERVAL_MAP[tf],
+                "limit": 200,
+            },
+            timeout=10,
+        )
         data = r.json()
-        if data["retCode"] != 0:
+        if data.get("retCode") != 0:
             return []
         out = []
-        for c in data["result"]["list"]:
-            out.append({
-                "open": float(c[1]),
-                "high": float(c[2]),
-                "low": float(c[3]),
-                "close": float(c[4]),
-                "volume": float(c[5]),
-            })
+        for c in data.get("result", {}).get("list", []) or []:
+            out.append(
+                {
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": float(c[5]),
+                }
+            )
+        # oldest -> newest
         return list(reversed(out))
-    except:
+    except Exception as e:
+        print("get_candles error:", e)
         return []
 
 
 def get_price(symbol):
+    """Latest price from Bybit linear ticker."""
     try:
-        r = requests.get(f"{BYBIT_ENDPOINT}/v5/market/tickers",
-                         params={"category": "linear", "symbol": symbol},
-                         timeout=10)
+        r = requests.get(
+            f"{BYBIT_ENDPOINT}/v5/market/tickers",
+            params={"category": "linear", "symbol": symbol},
+            timeout=10,
+        )
         d = r.json()
-        x = d.get("result", {}).get("list", [])
+        x = d.get("result", {}).get("list", []) or []
         if not x:
             return None
-        return float(x[0]["lastPrice"])
-    except:
+        return float(x[0].get("lastPrice"))
+    except Exception as e:
+        print("get_price error:", e)
         return None
 
 
@@ -132,20 +154,24 @@ def get_price(symbol):
 # GEMINI
 # ============================================================
 
-def run_gemini(prompt):
+def run_gemini(prompt: str) -> str:
     try:
         resp = model.generate_content(prompt)
         return resp.text or ""
-    except:
+    except Exception as e:
+        print("run_gemini error:", e)
         return ""
 
 
-def extract_json(txt):
+def extract_json(txt: str):
+    if not txt:
+        return None
     try:
         s = txt.index("{")
         e = txt.rindex("}")
-        return json.loads(txt[s:e+1])
-    except:
+        return json.loads(txt[s : e + 1])
+    except Exception as e:
+        print("extract_json error:", e, "text:", txt[:200])
         return None
 
 
@@ -182,12 +208,21 @@ Return ONLY JSON:
 # ============================================================
 
 async def scan_once(app):
+    """Run one full market scan and send signals."""
     global last_signal_time
 
     if not SCAN_ENABLED:
         return
+    if OWNER_CHAT_ID == 0:
+        # no owner set, skip sending
+        return
 
+    # 1) Get universe
     symbols = await asyncio.to_thread(get_bybit_symbols)
+    if not symbols:
+        return
+
+    # 2) Per symbol analysis
     for sym in symbols:
         c15 = get_candles(sym, "15m")
         c1h = get_candles(sym, "1h")
@@ -202,17 +237,18 @@ async def scan_once(app):
         if not data:
             continue
 
-        if data["direction"] == "flat":
+        if data.get("direction") == "flat":
             continue
-        if data["probability"] < MIN_PROB_SCAN:
+        if int(data.get("probability", 0)) < MIN_PROB_SCAN:
             continue
-        if data["rr"] < MIN_RR:
+        if float(data.get("rr", 0.0)) < MIN_RR:
             continue
 
         key = (sym, data["direction"])
         t = last_signal_time.get(key)
         now = time.time()
         if t and now - t < SIGNAL_COOLDOWN_SECONDS:
+            # still in cooldown
             continue
         last_signal_time[key] = now
 
@@ -227,10 +263,12 @@ async def scan_once(app):
             f"TP1: `{data['tp1']}`\n"
             f"Reason: _{data['summary']}_"
         )
+
         await app.bot.send_message(OWNER_CHAT_ID, msg, parse_mode="Markdown")
 
 
-async def scan_loop(app):
+async def scanner_loop(app):
+    """Background loop that keeps scanning every SCAN_INTERVAL_SECONDS."""
     await asyncio.sleep(5)
     while True:
         try:
@@ -240,6 +278,12 @@ async def scan_loop(app):
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 
+async def post_init(app):
+    """Hook called by PTB after application is initialized."""
+    # Start background scanner as a task on PTB's event loop
+    app.create_task(scanner_loop(app))
+
+
 # ============================================================
 # TG HANDLERS
 # ============================================================
@@ -247,17 +291,25 @@ async def scan_loop(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SCAN_ENABLED
     SCAN_ENABLED = True
-    await update.message.reply_text("✅ Auto scanner ON.")
+    await update.message.reply_text(
+        "✅ Auto scanner ON.\n"
+        f"Scanning Bybit linear futures every {SCAN_INTERVAL_SECONDS//60} minutes.\n"
+        f"Signals only if probability ≥ {MIN_PROB_SCAN}% and RR ≥ {MIN_RR}.\n"
+        "Cooldown per pair/direction: 10 minutes."
+    )
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SCAN_ENABLED
     SCAN_ENABLED = False
-    await update.message.reply_text("⏹ Auto scanner OFF.")
+    await update.message.reply_text("⏹ Auto scanner OFF. Manual commands still work.")
 
 
 async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Manual analysis not added yet.")
+    # Placeholder for future manual analysis
+    await update.message.reply_text(
+        "Manual analysis is not implemented in this minimal version yet."
+    )
 
 
 # ============================================================
@@ -265,22 +317,21 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def main():
-    app = (
+    application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)   # attach scanner loop
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(MessageHandler(filters.COMMAND, handle_pair))
-
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(scan_once(app)),
-                                interval=SCAN_INTERVAL_SECONDS, first=5)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(MessageHandler(filters.COMMAND, handle_pair))
 
     print("Bot running...")
-    app.run_polling()
+    application.run_polling()
 
 
 if __name__ == "__main__":
     main()
+

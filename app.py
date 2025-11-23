@@ -1,6 +1,6 @@
 # ============================================================
 # FULL APP.PY — BACKGROUND SCANNER + MANUAL ANALYSIS
-# Bybit data + Gemini + BingX autotrade
+# Bybit data + Gemini 2.5 + BingX autotrade
 # NO JobQueue, works on Render with PTB 20+
 # ============================================================
 
@@ -40,7 +40,8 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+# Use latest Gemini 2.5 Flash experimental by default
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-exp")
 
 # scanner / trade settings
 SCAN_INTERVAL_SECONDS = 300          # background scan interval
@@ -273,7 +274,7 @@ def force_json(text: str):
     except Exception:
         pass
 
-    # strip markdown fences like ```json ... ```
+    # strip markdown fences like ```json ... ``` / ```
     cleaned = re.sub(r"```(?:json)?", "", text)
     cleaned = cleaned.replace("```", "")
 
@@ -305,9 +306,18 @@ def force_json(text: str):
 def ask_gemini_json(prompt: str):
     """
     Call Gemini and return parsed JSON (or {}).
+    Uses response_mime_type='application/json' to force JSON output.
     """
     try:
-        resp = gemini_model.generate_content(prompt)
+        resp = gemini_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.25,
+                "top_p": 0.9,
+                "max_output_tokens": 2048,
+                "response_mime_type": "application/json",
+            },
+        )
         txt = (resp.text or "").strip()
         return force_json(txt)
     except Exception as e:
@@ -321,7 +331,15 @@ def ask_gemini_text(prompt: str) -> str:
     Used as fallback when JSON is unusable.
     """
     try:
-        resp = gemini_model.generate_content(prompt)
+        resp = gemini_model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "max_output_tokens": 512,
+                "response_mime_type": "text/plain",
+            },
+        )
         return (resp.text or "").strip()
     except Exception as e:
         print("Gemini text error:", e)
@@ -341,8 +359,24 @@ Analyse:
 - Current price: {price}
 - Candles JSON: {json.dumps(candles)}
 
-Focus on trend, key levels, VWAP behaviour, volume profile and reversal candles.
-Decide ONLY if there is a very clean setup.
+Focus on:
+- Trend direction (uptrend, downtrend, ranging)
+- Key support & resistance zones
+- VWAP behaviour
+- Fixed range volume profile zones (high volume nodes, low volume nodes)
+- Reversal candles (hammer, shooting star, engulfing, doji) at key levels.
+
+We only want VERY CLEAN setups.
+
+Rules:
+- If there is no clean, high-probability setup, respond with:
+  "direction": "flat",
+  "probability": 0,
+  and set "entry", "stop", "tp1" to 0.
+- If there IS a clean setup:
+  * direction must be "long" or "short"
+  * probability must be between 80 and 100
+  * rr must be at least {MIN_RR} (RR = distance to TP / distance to stop)
 
 Return ONLY valid JSON in this exact schema:
 
@@ -361,20 +395,33 @@ Return ONLY valid JSON in this exact schema:
 
 def build_manual_prompt(symbol, snapshot, price):
     return f"""
-You are a world-class crypto trader.
+You are a world-class crypto futures trader.
 
 Symbol: {symbol}
 Current price: {price}
-Snapshot: {json.dumps(snapshot)}
+Snapshot (multi-timeframe OHLCV JSON): {json.dumps(snapshot)}
 
-1. Evaluate upside, downside and flat probabilities (0-100 each).
-2. Choose "direction": "long", "short" or "flat".
-3. If direction is long/short AND its probability >= 80,
-   propose entry, stop, tp1, tp2 based on key levels
-   (recent swing high/low, reversal candle, strong support/resistance).
-4. If no good trade, set entry/stop/tp1/tp2 to null.
+Steps:
+1. Evaluate the probabilities (integer 0–100) for:
+   - upside (price moves up and breaks recent swing highs)
+   - downside (price moves down and breaks recent swing lows)
+   - flat (choppy, no edge, avoid trading)
+   These should roughly sum to 100.
 
-Return ONLY JSON:
+2. Choose "direction":
+   - "long" if upside is clearly best,
+   - "short" if downside is clearly best,
+   - "flat" if there is no edge or price is choppy.
+
+3. If direction is "long" or "short" AND its probability >= 80,
+   propose:
+   - entry: near current price but not random,
+   - stop: at a logical key level (swing high/low, reversal candle, clear S/R),
+   - tp1 and tp2: realistic targets in the direction of the trade.
+
+4. If there is NO good trade (best probability < 80), set entry, stop, tp1, tp2 to null.
+
+Return ONLY JSON in this exact schema:
 
 {{
  "symbol": "{symbol}",

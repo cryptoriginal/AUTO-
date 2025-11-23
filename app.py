@@ -46,9 +46,9 @@ SCAN_INTERVAL_SECONDS = 300  # scan every 5 minutes
 MIN_VOLUME = 50_000_000        # 24h quote volume filter
 MAX_SCAN_SYMBOLS = 25
 
-MIN_PROB_MANUAL = 75
-MIN_PROB_SCAN = 80             # >= 80% probability for autoscan
-MIN_RR = 1.9                   # >= 1:1.9 RR for autoscan
+MIN_PROB_MANUAL = 80           # only show entries if >= 80%
+MIN_PROB_SCAN = 80             # autoscan: >= 80% probability
+MIN_RR = 1.9                   # autoscan: >= 1:1.9 RR
 
 DEFAULT_TIMEFRAMES = [
     "5m", "15m", "30m", "1h", "2h", "4h",
@@ -59,14 +59,14 @@ SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
 AUTO_MAX_POSITIONS = 2
 AUTO_LEVERAGE = 3.0
 
-# 30 min cooldown between signals per (symbol, direction)
-SIGNAL_COOLDOWN_SECONDS = 1800
+# cooldown between signals per (symbol, direction): 10 minutes
+SIGNAL_COOLDOWN_SECONDS = 600
 
 last_signal_time = {}
 auto_open_positions = set()
 
-# None  => we don't know list, don't warn
-# set() => we know the list and check membership
+# None = we failed to load list -> don't warn
+# set([...]) = list successfully loaded -> check membership for warning
 SUPPORTED_BINGX = None
 
 
@@ -90,7 +90,8 @@ def load_supported_bingx_symbols():
     Load all USDT-M perpetual futures from BingX.
 
     If this fails, we set SUPPORTED_BINGX = None
-    -> no 'unsupported' warning, just try trading and let BingX reject if needed.
+    which means: do NOT warn about unsupported, just TRY trading and
+    let BingX respond if symbol really doesn't exist.
     """
     global SUPPORTED_BINGX
 
@@ -106,7 +107,7 @@ def load_supported_bingx_symbols():
 
         for c in contracts:
             sym = c.get("symbol", "")
-            # futures: BTC-USDT -> convert to BTCUSDT
+            # typical futures: BTC-USDT -> convert to BTCUSDT
             if sym.endswith("-USDT"):
                 symbols.add(sym.replace("-USDT", "USDT"))
 
@@ -114,19 +115,17 @@ def load_supported_bingx_symbols():
         print(f"Loaded {len(SUPPORTED_BINGX)} BingX USDT-M futures symbols.")
     except Exception as e:
         print("Failed to load BingX contracts:", e)
-        SUPPORTED_BINGX = None  # no list
+        SUPPORTED_BINGX = None  # no info
 
 
 # ============================================================
-# MARKET DATA (TRIPLE FALLBACK)
+# MARKET DATA (BINANCE ONLY)
 # ============================================================
 
 BINANCE_ENDPOINTS = [
     "https://fapi.binancevip.com",
     "https://api2.binance.com",
 ]
-
-OKX_ENDPOINT = "https://www.okx.com"
 
 
 def fetch_binance(path, params=None):
@@ -153,76 +152,10 @@ def fetch_binance(path, params=None):
     raise RuntimeError("Binance failed in all attempts.")
 
 
-def fetch_okx(symbol, interval):
-    """
-    OKX futures candles: ETHUSDT -> ETH-USDT-SWAP
-    """
-    try:
-        okx_symbol = symbol.replace("USDT", "-USDT-SWAP")
-        url = f"{OKX_ENDPOINT}/api/v5/market/candles"
-        r = requests.get(url, params={"instId": okx_symbol, "bar": interval}, timeout=10)
-        r.raise_for_status()
-        raw = r.json()
-
-        candles = [{
-            "open_time": c[0],
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5]),
-        } for c in raw.get("data", [])]
-
-        return candles if candles else None
-    except Exception as e:
-        print(f"fetch_okx error {symbol} {interval}:", e)
-        return None
-
-
-def fetch_bingx(symbol, interval):
-    """
-    BingX futures candles: ETHUSDT -> ETH-USDT
-    """
-    if not bingx:
-        return None
-
-    try:
-        bingx_symbol = symbol.replace("USDT", "-USDT")
-        data = bingx.market_get_candles(bingx_symbol, interval, 100)
-
-        candles = [{
-            "open_time": c["t"],
-            "open": float(c["o"]),
-            "high": float(c["h"]),
-            "low": float(c["l"]),
-            "close": float(c["c"]),
-            "volume": float(c["v"]),
-        } for c in data.get("data", [])]
-
-        return candles if candles else None
-    except Exception as e:
-        print(f"fetch_bingx error {symbol} {interval}:", e)
-        return None
-
-
 def get_klines(symbol, interval):
     """
-    Master candle function:
-    1) BingX
-    2) OKX
-    3) Binance
+    Master candle function using ONLY Binance.
     """
-    # 1️⃣ BingX
-    c = fetch_bingx(symbol, interval)
-    if c:
-        return c
-
-    # 2️⃣ OKX
-    c = fetch_okx(symbol, interval)
-    if c:
-        return c
-
-    # 3️⃣ Binance
     try:
         raw = fetch_binance("/fapi/v1/klines", {
             "symbol": symbol,
@@ -248,7 +181,6 @@ def get_klines(symbol, interval):
 def get_current_price(symbol):
     """
     Get real-time futures price from Binance ticker.
-    If it fails, caller will fall back to last candle close.
     """
     try:
         data = fetch_binance("/fapi/v1/ticker/price", {"symbol": symbol})
@@ -264,8 +196,8 @@ def get_current_price(symbol):
 
 def get_top_symbols():
     """
-    Use Binance 24h ticker just to pick high-volume pairs (>= MIN_VOLUME).
-    Autoscan & trades still use BingX/OKX/Binance candles via get_klines().
+    Use Binance 24h ticker to pick high-volume pairs (>= MIN_VOLUME).
+    Autoscan & trades still use Binance candles via get_klines().
     """
     try:
         data = fetch_binance("/fapi/v1/ticker/24hr")
@@ -327,13 +259,13 @@ You are a world-class crypto futures analyst.
 
 You MUST base your view mainly on:
 - price action and market structure
-- VWAP (is price above/below? is it reclaiming/rejecting?)
+- VWAP (is price above/below? reclaiming/rejecting?)
 - fixed range volume profile of the recent swing high to swing low
-  (where are the high-volume nodes / value area / POC etc.)
+  (value area, POC, high volume nodes)
 - key support/resistance and liquidity zones
 - trendlines and chart patterns (channels, wedges, triangles)
 - candlestick confirmation (hammer, pin bar, doji, engulfing etc.)
-- confirmation from EMAs/RSI/MACD only as secondary confluence
+- EMAs/RSI/MACD only as secondary confluence
 
 TASK:
 Analyse the symbol and produce a JSON object with:
@@ -362,7 +294,7 @@ Rules:
 symbol: {symbol}
 requested_timeframe: {timeframe}
 current_price: {price}
-snapshot (multi-timeframe OHLCV): {json.dumps(snapshot)}
+snapshot (multi-timeframe OHLCV from Binance futures): {json.dumps(snapshot)}
 
 Return STRICT JSON ONLY, no extra text.
 """
@@ -377,7 +309,7 @@ trade, using:
 
 - VWAP relative position
 - fixed range volume profile of the recent swing high to swing low
-  (focus on value area, POC, high volume nodes)
+  (value area, POC, high volume nodes)
 - key support/resistance zones
 - candlestick confirmation (hammer / pin bar / doji / engulfing)
 - basic indicators (EMA/RSI/MACD) only as confirmation
@@ -405,7 +337,7 @@ Hard Rules:
 
 symbol: {symbol}
 current_price: {price}
-snapshot (multi-timeframe OHLCV): {json.dumps(snapshot)}
+snapshot (multi-timeframe OHLCV from Binance futures): {json.dumps(snapshot)}
 
 Return STRICT JSON ONLY, no explanation outside JSON.
 """
@@ -551,29 +483,50 @@ def analyze_command(symbol, timeframe):
         )
 
     summary = data.get("summary", "").strip()
+    direction = (data.get("direction") or "").lower()
+    up = int(data.get("upside_probability", 0) or 0)
+    down = int(data.get("downside_probability", 0) or 0)
+    flat = int(data.get("flat_probability", 0) or 0)
+    rr = float(data.get("rr", 0) or 0)
+
+    # main probability in direction of trade
+    if direction == "long":
+        main_prob = up
+    elif direction == "short":
+        main_prob = down
+    else:
+        main_prob = 0
 
     result_lines = [
         warn + f"📊 *{symbol} Analysis*",
         f"Price: `{price}`",
-        f"Direction: *{data.get('direction')}*",
-        f"Upside: `{data.get('upside_probability')}%`",
-        f"Downside: `{data.get('downside_probability')}%`",
-        f"Flat: `{data.get('flat_probability')}%`",
+        f"Direction: *{direction}*",
+        f"Upside: `{up}%`",
+        f"Downside: `{down}%`",
+        f"Flat: `{flat}%`",
     ]
 
     if summary:
         result_lines.append("")
         result_lines.append(f"💡 *Why:* {summary}")
 
-    if data.get("entry"):
+    # Only show trade plan if probability >= MIN_PROB_MANUAL and rr >= 1.8
+    if (
+        main_prob >= MIN_PROB_MANUAL
+        and direction in ("long", "short")
+        and data.get("entry") is not None
+    ):
         result_lines.extend([
             "",
             f"Entry: `{data['entry']}`",
             f"SL: `{data['sl']}`",
             f"TP1: `{data['tp1']}`",
             f"TP2: `{data.get('tp2')}`",
-            f"RR: `{data.get('rr')}`",
+            f"RR: `{rr}`",
         ])
+    else:
+        result_lines.append("")
+        result_lines.append("⛔ Probability is below 80% for a clean setup, so no trade entry/SL/TP suggested.")
 
     return "\n".join(result_lines)
 
@@ -592,15 +545,15 @@ def analyze_scan(symbol):
     if not data:
         return None
 
-    prob = int(data.get("probability", 0))
-    rr = float(data.get("rr", 0))
+    prob = int(data.get("probability", 0) or 0)
+    rr = float(data.get("rr", 0) or 0)
 
     if prob < MIN_PROB_SCAN or rr < MIN_RR:
         return None
 
     return {
         "symbol": symbol,
-        "direction": data["direction"],
+        "direction": (data["direction"] or "").lower(),
         "probability": prob,
         "entry": float(data["entry"]),
         "sl": float(data["sl"]),
@@ -618,7 +571,9 @@ def analyze_scan(symbol):
 def cmd_start(update, context: CallbackContext):
     global SCAN_ENABLED
     SCAN_ENABLED = True
-    update.message.reply_text("✅ Auto Scanner ON (scanning every 5 min, 30 min cooldown per coin)")
+    update.message.reply_text(
+        "✅ Auto Scanner ON (scanning every 5 min, 10 min cooldown per symbol/direction)."
+    )
 
 
 def cmd_stop(update, context: CallbackContext):
@@ -675,7 +630,7 @@ def scanner_job(context: CallbackContext):
         key = (sym, sig["direction"])
         last = last_signal_time.get(key)
         if last and (now - last).total_seconds() < SIGNAL_COOLDOWN_SECONDS:
-            continue  # 30m cooldown
+            continue  # 10m cooldown
 
         last_signal_time[key] = now
 
@@ -735,3 +690,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

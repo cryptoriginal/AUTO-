@@ -4,7 +4,7 @@ import time
 import requests
 from datetime import datetime, timezone
 
-from google import genai
+import google.generativeai as genai
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -27,16 +27,19 @@ OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 BINGX_API_KEY = os.getenv("BINGX_API_KEY")
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET")
 
-if not TELEGRAM_BOT_TOKEN: raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not GEMINI_API_KEY: raise RuntimeError("Missing GEMINI_API_KEY")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY")
 
 
 # =============================
 # CONSTANTS
 # =============================
 SCAN_ENABLED = True
-SCAN_INTERVAL = 300              # 5 minutes
-SIGNAL_COOLDOWN_SECONDS = 600    # 10 minutes
+SCAN_INTERVAL = 300                  # 5 minutes
+SIGNAL_COOLDOWN_SECONDS = 600        # 10 minutes
+
 MIN_VOLUME = 50_000_000
 MIN_PROB_MANUAL = 80
 MIN_PROB_SCAN = 80
@@ -52,11 +55,17 @@ last_signal_time = {}
 auto_positions = set()
 SUPPORTED_BINGX = set()
 
-# =============================
-# CLIENTS
-# =============================
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# =============================
+# GEMINI SETUP
+# =============================
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+
+# =============================
+# Initialize BingX Client
+# =============================
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
     bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET, timestamp="local")
@@ -71,7 +80,7 @@ def load_supported_bingx_symbols():
         data = bingx.swap_v2_get_contracts()
         lst = data.get("data", {}).get("contracts", [])
         SUPPORTED_BINGX = {c["symbol"].replace("-USDT", "USDT") for c in lst}
-        print("Loaded BingX symbols:", len(SUPPORTED_BINGX))
+        print("Loaded BingX:", len(SUPPORTED_BINGX))
     except:
         SUPPORTED_BINGX = set()
 
@@ -99,8 +108,8 @@ def fetch_okx(symbol, tf):
         url = "https://www.okx.com/api/v5/market/candles"
         r = requests.get(url, params={"instId": f"{symbol}-USDT-SWAP","bar": tf}, timeout=8)
         r.raise_for_status()
-        raw = r.json()
 
+        raw = r.json()
         return [{
             "open_time": c[0],
             "open": float(c[1]),
@@ -114,20 +123,19 @@ def fetch_okx(symbol, tf):
 
 
 def fetch_binance(symbol, tf):
-    urls = [
+    endpoints = [
         "https://fapi.binancevip.com/fapi/v1/klines",
         "https://api2.binance.com/fapi/v1/klines"
     ]
 
-    for url in urls:
+    for ep in endpoints:
         try:
-            r = requests.get(url, params={"symbol":symbol,"interval":tf,"limit":120}, timeout=8)
+            r = requests.get(ep, params={"symbol":symbol,"interval":tf,"limit":120}, timeout=8)
             if r.status_code in [418,429,451,403] or r.status_code >= 500:
                 continue
-
             r.raise_for_status()
-            raw = r.json()
 
+            raw = r.json()
             return [{
                 "open_time": c[0],
                 "open": float(c[1]),
@@ -153,7 +161,7 @@ def get_klines(symbol, tf):
 
 
 # =============================
-# TOP SYMBOL SCAN (Binance)
+# TOP SYMBOL SCAN
 # =============================
 def get_top_symbols():
     try:
@@ -165,8 +173,7 @@ def get_top_symbols():
 
     pairs = [
         s for s in data
-        if s["symbol"].endswith("USDT")
-        and float(s["quoteVolume"]) >= MIN_VOLUME
+        if s["symbol"].endswith("USDT") and float(s["quoteVolume"]) >= MIN_VOLUME
     ]
 
     pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
@@ -190,22 +197,22 @@ def build_snapshot(symbol, tfs):
 # =============================
 # GEMINI PROMPTS
 # =============================
-def prompt_manual(symbol, timeframe, snapshot, price):
+def prompt_manual(symbol, tf, snapshot, price):
     return f"""
 You are a world-class crypto futures analyst.
 
-Use:
-- VWAP importance
-- Fixed Range Volume Profile (recent swing high–low)
-- Support/Resistance
-- Reversal candle patterns (hammer, doji, engulfing)
-- Trend structure
-- Breakout/bounce confirmation
+Weight these factors heavily:
+- VWAP interaction
+- Fixed Range Volume Profile (recent swing-high to swing-low)
+- Key support/resistance
+- Trend continuation or reversal structure
+- Strong candle patterns (hammer, doji, engulfing)
+- Liquidity sweep and bounce behavior
 
 Return ONLY JSON:
 {{
  "direction": "long/short",
- "summary": "<1 sentence reason>",
+ "summary": "<short reason>",
  "upside_probability": %,
  "downside_probability": %,
  "flat_probability": %,
@@ -217,7 +224,7 @@ Return ONLY JSON:
 }}
 
 Symbol: {symbol}
-Timeframe: {timeframe}
+Timeframe: {tf}
 Price: {price}
 Snapshot: {json.dumps(snapshot)}
 """
@@ -225,10 +232,11 @@ Snapshot: {json.dumps(snapshot)}
 
 def prompt_scan(symbol, snapshot, price):
     return f"""
-Act as a high-speed crypto scanner using:
-VWAP + Fixed Range Volume Profile + candle patterns.
+Act as an ultra-fast crypto futures scanner.
 
-Return ONLY JSON with:
+Use VWAP + Fixed Range Volume Profile + candle-pattern confirmation.
+
+Return ONLY JSON:
 {{
  "direction": "long/short",
  "probability": %,
@@ -246,16 +254,13 @@ Snapshot: {json.dumps(snapshot)}
 
 
 # =============================
-# GEMINI HELPERS
+# GEMINI WRAPPER
 # =============================
 def call_gemini(prompt):
     try:
-        out = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        return out.text
-    except Exception as e:
+        response = model.generate_content(prompt)
+        return response.text
+    except:
         return None
 
 
@@ -285,7 +290,7 @@ def get_bingx_usdt_balance():
 # =============================
 # AUTO TRADE EXECUTION
 # =============================
-def binance_to_bingx(symbol):
+def binance_to_bingx(symbol):  
     return symbol.replace("USDT", "-USDT")
 
 
@@ -299,7 +304,7 @@ async def auto_trade(sig, context):
 
     balance = get_bingx_usdt_balance()
     if not balance or balance <= 0:
-        await context.bot.send_message(OWNER_CHAT_ID, "⚠️ No balance for auto-trade")
+        await context.bot.send_message(OWNER_CHAT_ID, "⚠️ Not enough balance for auto-trade.")
         return
 
     entry = sig["entry"]
@@ -319,8 +324,8 @@ async def auto_trade(sig, context):
 
         await context.bot.send_message(
             OWNER_CHAT_ID,
-            f"✅ Auto Trade Executed\n"
-            f"{bingx_symbol}\nSide: {side}\nQty: {qty:.6f}\n"
+            f"✅ AutoTrade Executed\n"
+            f"{bingx_symbol}\nSide:{side} Qty:{qty:.6f}\n"
             f"Entry:{entry}  SL:{sig['sl']}  TP:{sig['tp1']}"
         )
     except Exception as e:
@@ -328,52 +333,61 @@ async def auto_trade(sig, context):
 
 
 # =============================
-# MANUAL ANALYSIS COMMAND
+# MANUAL ANALYSIS
 # =============================
-async def analyze_manual(symbol, timeframe):
-    tfs = [timeframe] if timeframe else DEFAULT_TFS
+async def analyze_manual(symbol, tf):
+    tfs = [tf] if tf else DEFAULT_TFS
     snapshot, price = build_snapshot(symbol, tfs)
 
     if price is None:
-        return f"❌ Could not fetch {symbol} candles"
+        return f"❌ Could not fetch {symbol} candles."
 
-    raw = call_gemini(prompt_manual(symbol, timeframe, snapshot, price))
+    raw = call_gemini(prompt_manual(symbol, tf, snapshot, price))
     if not raw:
-        return f"❌ Gemini request failed"
+        return "❌ Gemini API error."
 
     data = extract_json(raw)
     if not data:
-        return f"❌ JSON parsing error"
+        return "❌ JSON parsing failed."
 
-    prob = max(data.get("upside_probability",0), data.get("downside_probability",0))
+    prob = max(data["upside_probability"], data["downside_probability"])
 
-    msg = f"📊 *{symbol} Analysis*\nPrice: `{price}`\nSummary: _{data.get('summary','')}_\n\n"
-    msg += f"Upside: `{data['upside_probability']}%`\n"
-    msg += f"Downside: `{data['downside_probability']}%`\n"
-    msg += f"Flat: `{data['flat_probability']}%`\n"
+    msg = (
+        f"📊 *{symbol} Analysis*\n"
+        f"Price: `{price}`\n"
+        f"Reason: _{data['summary']}_\n\n"
+        f"Upside: `{data['upside_probability']}%`\n"
+        f"Downside: `{data['downside_probability']}%`\n"
+        f"Flat: `{data['flat_probability']}%`\n"
+    )
 
     if prob >= MIN_PROB_MANUAL:
-        msg += f"\nEntry:`{data['entry']}`\nSL:`{data['sl']}`\nTP1:`{data['tp1']}`\nTP2:`{data['tp2']}`"
+        msg += (
+            f"\nEntry:`{data['entry']}`\n"
+            f"SL:`{data['sl']}`\n"
+            f"TP1:`{data['tp1']}`\n"
+            f"TP2:`{data['tp2']}`"
+        )
 
     return msg
 
 
 # =============================
-# MANUAL HANDLE
+# COMMAND HANDLER
 # =============================
-async def handle_pair(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip().split()
     symbol = msg[0].replace("/", "").upper()
-    timeframe = msg[1] if len(msg) > 1 else None
+    tf = msg[1] if len(msg) > 1 else None
 
     await update.message.reply_text(f"⏳ Analysing {symbol}...")
 
-    result = await analyze_manual(symbol, timeframe)
+    result = await analyze_manual(symbol, tf)
     await update.message.reply_markdown(result)
 
 
 # =============================
-# SCANNER ANALYSIS
+# SCAN
 # =============================
 def analyze_scan(symbol):
     snapshot, price = build_snapshot(symbol, SCAN_TFS)
@@ -388,8 +402,8 @@ def analyze_scan(symbol):
     if not data:
         return None
 
-    prob = int(data["probability"])
-    rr = float(data["rr"])
+    prob = data["probability"]
+    rr = data["rr"]
 
     if prob < MIN_PROB_SCAN or rr < MIN_RR:
         return None
@@ -406,10 +420,7 @@ def analyze_scan(symbol):
     }
 
 
-# =============================
-# SCANNER JOB
-# =============================
-async def scanner_job(context:ContextTypes.DEFAULT_TYPE):
+async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
     if not SCAN_ENABLED:
         return
 
@@ -421,16 +432,13 @@ async def scanner_job(context:ContextTypes.DEFAULT_TYPE):
     now = datetime.now(timezone.utc)
 
     for sym in symbols:
-        try:
-            sig = analyze_scan(sym)
-        except:
-            continue
-
+        sig = analyze_scan(sym)
         if not sig:
             continue
 
         key = (sym, sig["direction"])
         last = last_signal_time.get(key)
+        
         if last and (now - last).total_seconds() < SIGNAL_COOLDOWN_SECONDS:
             continue
 
@@ -439,9 +447,13 @@ async def scanner_job(context:ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             OWNER_CHAT_ID,
             f"🚨 *AI SIGNAL*\n"
-            f"Symbol: `{sym}`\nDirection: `{sig['direction']}`\n"
-            f"Prob:`{sig['probability']}%`\nRR:`{sig['rr']}`\n"
-            f"Entry:`{sig['entry']}`\nSL:`{sig['sl']}`\nTP1:`{sig['tp1']}`",
+            f"Symbol:`{sym}`\n"
+            f"Direction:`{sig['direction']}`\n"
+            f"Probability:`{sig['probability']}%`\n"
+            f"RR:`{sig['rr']}`\n"
+            f"Entry:`{sig['entry']}`\n"
+            f"SL:`{sig['sl']}`\n"
+            f"TP1:`{sig['tp1']}`",
             parse_mode="Markdown"
         )
 
@@ -454,7 +466,9 @@ async def scanner_job(context:ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update, context):
     global SCAN_ENABLED
     SCAN_ENABLED = True
-    await update.message.reply_text("✅ Auto Scanner ON (5 min scan / 10 min cooldown)")
+    await update.message.reply_text(
+        "✅ Auto Scanner ON (5m scan, 10m cooldown)"
+    )
 
 
 async def cmd_stop(update, context):
@@ -469,7 +483,11 @@ async def cmd_stop(update, context):
 async def main():
     load_supported_bingx_symbols()
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))

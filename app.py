@@ -53,7 +53,7 @@ SCAN_ENABLED = True
 SUPPORTED_BINGX = set()
 auto_open_positions = set()
 last_signal_time = {}
-pending_manual_signals = {}  # chat_id -> signal dict
+pending_manual_signals = {}  # chat_id -> signal dict (for future /yes flow if needed)
 
 # ============================================================
 # CLIENTS
@@ -71,7 +71,7 @@ gemini_model = genai.GenerativeModel(
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # Simple init – matches your installed py-bingx
+    # Simple init – matches py-bingx
     bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
 
 # ============================================================
@@ -331,6 +331,8 @@ Return ONLY ONE JSON object in this schema:
 Snapshot JSON to analyse:
 {json.dumps(snapshot)}
 """
+
+
 # ============================================================
 # BINGX HELPERS (BEST-EFFORT, FAIL-SAFE)
 # ============================================================
@@ -739,17 +741,17 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# POST_INIT & MAIN
+# POST_INIT & MAIN  (NO asyncio.run HERE)
 # ============================================================
 
 async def post_init(app):
     # load BingX tradable symbols once
     await asyncio.to_thread(load_supported_bingx_symbols)
-    # start async scanner loop
+    # start async scanner loop inside PTB event loop
     app.create_task(scan_loop(app))
 
 
-async def main():
+def main():
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -762,8 +764,9 @@ async def main():
     application.add_handler(MessageHandler(filters.COMMAND, handle_pair))
 
     print("Bot running with JSON-safe Gemini + scanner...")
-    await application.run_polling()
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+

@@ -63,7 +63,13 @@ last_signal_time: dict[tuple[str, str], float] = {}
 # ============================================================
 
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+gemini_model = genai.GenerativeModel(
+    GEMINI_MODEL,
+    generation_config={
+        "response_mime_type": "application/json",
+        "temperature": 0.25,
+    }
+)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
@@ -235,27 +241,30 @@ def get_bingx_usdt_balance():
 
 def force_json(text: str):
     """
-    Extract first valid JSON object from text.
-    Last-resort fallback → {} instead of raising.
+    Extract valid JSON from Gemini output.
+    Handles:
+    - markdown code fences ```json ... ```
+    - extra commentary before/after JSON
+    - stray markdown chars
+    Always returns a dict ({} if completely broken).
     """
     if not text:
         return {}
 
-    # direct JSON
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
+    # Strip markdown code fences
+    text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```", "", text)
 
-    # bracket slice
+    # First try: slice between first "{" and last "}"
     try:
         start = text.index("{")
         end = text.rindex("}")
-        return json.loads(text[start:end + 1])
+        candidate = text[start:end+1]
+        return json.loads(candidate)
     except Exception:
         pass
 
-    # regex
+    # Second: regex { ... }
     try:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
@@ -263,7 +272,12 @@ def force_json(text: str):
     except Exception:
         pass
 
-    return {}
+    # Third: try to strip non-JSON characters crudely
+    try:
+        cleaned = re.sub(r"[^\{\}\[\]0-9A-Za-z\":,\.\-\s]", "", text)
+        return json.loads(cleaned)
+    except Exception:
+        return {}
 
 
 def ask_gemini(prompt: str | dict):
@@ -598,58 +612,5 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     # Remove leading "/" and any arguments after a space
-    if text.startswith("/"):
-        symbol = text[1:].split()[0].upper()
-    else:
-        symbol = text.replace("/", "").split()[0].upper()
-
-    if not symbol.endswith("USDT"):
-        await update.message.reply_text("Send coin like: `/btcusdt` or `/ethusdt`", parse_mode="Markdown")
-        return
-
-    await update.message.reply_text(f"⏳ Analysing {symbol}...")
-
-    try:
-        result = await analyze_manual(symbol)
-    except Exception as e:
-        result = f"❌ Error analysing {symbol}: {e}"
-
-    await update.message.reply_markdown(result)
-
-
-# ============================================================
-# POST_INIT + MAIN
-# ============================================================
-
-async def post_init(app):
-    # load BingX symbols once
-    await asyncio.to_thread(load_supported_bingx_symbols)
-    # start scanner loop
-    app.create_task(scanner_loop(app))
-
-
-def main():
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("stop", cmd_stop))
-
-    # Any other command → treated as coin, e.g. /btcusdt
-    application.add_handler(
-        MessageHandler(
-            filters.COMMAND & ~filters.Regex(r"^/(start|stop)$"),
-            handle_pair,
-        )
-    )
-
-    print("Bot running...")
-    application.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    if text.startswith("/")
+::contentReference[oaicite:0]{index=0}

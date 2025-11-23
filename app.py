@@ -37,18 +37,18 @@ GEMINI_MODEL_SCANNER = "gemini-2.5-flash"
 
 
 # ============================================================
-# SCANNER SETTINGS
+# CONFIG / SCANNER SETTINGS
 # ============================================================
 
 SCAN_ENABLED = True
-SCAN_INTERVAL_SECONDS = 300  # 5 minutes
+SCAN_INTERVAL_SECONDS = 300  # scan every 5 minutes
 
-MIN_VOLUME = 50_000_000
+MIN_VOLUME = 50_000_000        # 24h quote volume filter
 MAX_SCAN_SYMBOLS = 25
 
 MIN_PROB_MANUAL = 75
-MIN_PROB_SCAN = 85
-MIN_RR = 2.1
+MIN_PROB_SCAN = 80             # >= 80% probability for autoscan
+MIN_RR = 1.9                   # >= 1:1.9 RR for autoscan
 
 DEFAULT_TIMEFRAMES = [
     "5m", "15m", "30m", "1h", "2h", "4h",
@@ -59,11 +59,14 @@ SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
 AUTO_MAX_POSITIONS = 2
 AUTO_LEVERAGE = 3.0
 
+# 30 min cooldown between signals per (symbol, direction)
+SIGNAL_COOLDOWN_SECONDS = 1800
+
 last_signal_time = {}
 auto_open_positions = set()
 
-# None = we failed to load list → treat all as “maybe supported”
-# set([...]) = list successfully loaded → we check membership
+# None  => we don't know list, don't warn
+# set() => we know the list and check membership
 SUPPORTED_BINGX = None
 
 
@@ -87,8 +90,7 @@ def load_supported_bingx_symbols():
     Load all USDT-M perpetual futures from BingX.
 
     If this fails, we set SUPPORTED_BINGX = None
-    which means: do NOT warn about unsupported, just TRY trading and
-    let BingX respond if symbol really doesn't exist.
+    -> no 'unsupported' warning, just try trading and let BingX reject if needed.
     """
     global SUPPORTED_BINGX
 
@@ -104,7 +106,7 @@ def load_supported_bingx_symbols():
 
         for c in contracts:
             sym = c.get("symbol", "")
-            # Typical futures format: BTC-USDT
+            # futures: BTC-USDT -> convert to BTCUSDT
             if sym.endswith("-USDT"):
                 symbols.add(sym.replace("-USDT", "USDT"))
 
@@ -112,7 +114,7 @@ def load_supported_bingx_symbols():
         print(f"Loaded {len(SUPPORTED_BINGX)} BingX USDT-M futures symbols.")
     except Exception as e:
         print("Failed to load BingX contracts:", e)
-        SUPPORTED_BINGX = None  # no info, no warnings
+        SUPPORTED_BINGX = None  # no list
 
 
 # ============================================================
@@ -121,7 +123,7 @@ def load_supported_bingx_symbols():
 
 BINANCE_ENDPOINTS = [
     "https://fapi.binancevip.com",
-    "https://api2.binance.com"
+    "https://api2.binance.com",
 ]
 
 OKX_ENDPOINT = "https://www.okx.com"
@@ -129,7 +131,7 @@ OKX_ENDPOINT = "https://www.okx.com"
 
 def fetch_binance(path, params=None):
     """
-    Binance with retries. Used for klines and 24h ticker.
+    Binance with retries. Used for klines, ticker, 24h volume.
     """
     params = params or {}
     for endpoint in BINANCE_ENDPOINTS:
@@ -153,7 +155,7 @@ def fetch_binance(path, params=None):
 
 def fetch_okx(symbol, interval):
     """
-    OKX futures candles: ETHUSDT → ETH-USDT-SWAP
+    OKX futures candles: ETHUSDT -> ETH-USDT-SWAP
     """
     try:
         okx_symbol = symbol.replace("USDT", "-USDT-SWAP")
@@ -179,7 +181,7 @@ def fetch_okx(symbol, interval):
 
 def fetch_bingx(symbol, interval):
     """
-    BingX futures candles: ETHUSDT → ETH-USDT
+    BingX futures candles: ETHUSDT -> ETH-USDT
     """
     if not bingx:
         return None
@@ -243,14 +245,27 @@ def get_klines(symbol, interval):
     return candles if candles else None
 
 
+def get_current_price(symbol):
+    """
+    Get real-time futures price from Binance ticker.
+    If it fails, caller will fall back to last candle close.
+    """
+    try:
+        data = fetch_binance("/fapi/v1/ticker/price", {"symbol": symbol})
+        return float(data["price"])
+    except Exception as e:
+        print(f"get_current_price error {symbol}:", e)
+        return None
+
+
 # ============================================================
 # TOP SYMBOLS FOR SCANNER (BINANCE 24H VOL)
 # ============================================================
 
 def get_top_symbols():
     """
-    Use Binance 24h ticker just to pick high-volume pairs.
-    Scanner & trades still use BingX/OKX/Binance candles above.
+    Use Binance 24h ticker just to pick high-volume pairs (>= MIN_VOLUME).
+    Autoscan & trades still use BingX/OKX/Binance candles via get_klines().
     """
     try:
         data = fetch_binance("/fapi/v1/ticker/24hr")
@@ -290,8 +305,14 @@ def build_snapshot(symbol, timeframes):
             klines = None
 
         snapshot[tf] = klines
-        if klines:
+        if klines and current_price is None:
+            # backup price from last close (used only if ticker fails)
             current_price = klines[-1]["close"]
+
+    # override with live ticker if possible
+    live_price = get_current_price(symbol)
+    if live_price is not None:
+        current_price = live_price
 
     return snapshot, current_price
 
@@ -302,35 +323,48 @@ def build_snapshot(symbol, timeframes):
 
 def prompt_for_pair(symbol, timeframe, snapshot, price):
     return f"""
-You are a world-class crypto futures analyst with deep knowledge of:
-- Price action, liquidity, key levels, trendlines, chart patterns
-- RSI / MACD / EMAs as confirmation
-- Reversal candles (hammer, doji, engulfing, pin-bars)
+You are a world-class crypto futures analyst.
 
-You analyse the given symbol using the multi-timeframe snapshot
-and output strict JSON with:
+You MUST base your view mainly on:
+- price action and market structure
+- VWAP (is price above/below? is it reclaiming/rejecting?)
+- fixed range volume profile of the recent swing high to swing low
+  (where are the high-volume nodes / value area / POC etc.)
+- key support/resistance and liquidity zones
+- trendlines and chart patterns (channels, wedges, triangles)
+- candlestick confirmation (hammer, pin bar, doji, engulfing etc.)
+- confirmation from EMAs/RSI/MACD only as secondary confluence
 
-- upside_probability
-- downside_probability
-- flat_probability
-- direction  ("long" | "short" | "flat")
-- entry
-- sl
-- tp1
-- tp2
-- rr   (risk:reward)
+TASK:
+Analyse the symbol and produce a JSON object with:
+
+- "upside_probability": int 0-100
+- "downside_probability": int 0-100
+- "flat_probability": int 0-100
+- "direction": "long" | "short" | "flat"
+- "entry": float
+- "sl": float
+- "tp1": float
+- "tp2": float
+- "rr": float   (risk:reward based on entry & sl vs tp1)
+- "summary": short string (1-3 sentences) explaining
+             WHY the coin is bullish or bearish and why this
+             is a good trade idea (mention VWAP / volume profile /
+             and candle pattern if relevant).
 
 Rules:
-- rr must be >= 1.8 if you propose a trade.
-- SL must be at a real key level / liquidity area, not random.
-- Use price action first, indicators only as confirmation.
-- If market is choppy / unclear, increase flat_probability.
+- If you suggest a trade, rr must be >= 1.8.
+- SL MUST be at a logical key level: recent swing high/low, clear
+  structure level, or high/low of the reversal candle.
+- If market is choppy or unclear, increase flat_probability and set
+  direction="flat" and entries/sl/tp near current_price.
 
 symbol: {symbol}
 requested_timeframe: {timeframe}
 current_price: {price}
-snapshot: {json.dumps(snapshot)}
-Return ONLY JSON, no explanation.
+snapshot (multi-timeframe OHLCV): {json.dumps(snapshot)}
+
+Return STRICT JSON ONLY, no extra text.
 """
 
 
@@ -338,28 +372,42 @@ def prompt_for_scan(symbol, snapshot, price):
     return f"""
 You are an ultra-fast crypto futures scanner.
 
-You scan the symbol and decide if there is a high probability trade
-(upside or downside) based on this snapshot.
+You scan the symbol and decide if there is a STRONG high probability
+trade, using:
 
-Return strict JSON with:
-- direction  ("long" | "short")
-- probability  (0-100)
-- entry
-- sl
-- tp1
-- tp2
-- rr  (risk:reward)
+- VWAP relative position
+- fixed range volume profile of the recent swing high to swing low
+  (focus on value area, POC, high volume nodes)
+- key support/resistance zones
+- candlestick confirmation (hammer / pin bar / doji / engulfing)
+- basic indicators (EMA/RSI/MACD) only as confirmation
 
-Rules:
-- Only give a trade if probability >= {MIN_PROB_SCAN} and rr >= {MIN_RR}.
-- SL must be at a logical key level, not random.
-- Entry can be near current price or slight pullback.
-- Prefer clean RR structure.
+You MUST return JSON with:
+
+- "direction": "long" | "short"
+- "probability": int 0-100  (probability of your chosen direction)
+- "entry": float
+- "sl": float
+- "tp1": float
+- "tp2": float
+- "rr": float   (risk:reward based on entry & sl vs tp1)
+- "reason": short string explaining in 1-3 sentences WHY this trade
+            is good (e.g. "price bouncing at VWAP + demand zone with
+            bullish engulfing", etc.)
+
+Hard Rules:
+- Only output a trade if probability >= {MIN_PROB_SCAN} AND rr >= {MIN_RR}.
+- Otherwise, set probability < {MIN_PROB_SCAN} and choose any rr,
+  indicating NO TRADE (we will filter it out).
+- SL MUST be at a logical key level: recent swing high/low,
+  clear structure level, or high/low of reversal candle.
+- Entry should make sense with current_price (no crazy far entries).
 
 symbol: {symbol}
 current_price: {price}
-snapshot: {json.dumps(snapshot)}
-Return ONLY JSON.
+snapshot (multi-timeframe OHLCV): {json.dumps(snapshot)}
+
+Return STRICT JSON ONLY, no explanation outside JSON.
 """
 
 
@@ -484,7 +532,7 @@ def analyze_command(symbol, timeframe):
 
     snapshot, price = build_snapshot(symbol, tfs)
     if price is None:
-        return f"❌ Could not fetch candles for {symbol} from any exchange."
+        return f"❌ Could not fetch candles or price for {symbol}."
 
     raw = call_gemini(
         prompt_for_pair(symbol, timeframe, snapshot, price),
@@ -502,7 +550,9 @@ def analyze_command(symbol, timeframe):
             f"Analysis only, auto-trade disabled.\n\n"
         )
 
-    result = [
+    summary = data.get("summary", "").strip()
+
+    result_lines = [
         warn + f"📊 *{symbol} Analysis*",
         f"Price: `{price}`",
         f"Direction: *{data.get('direction')}*",
@@ -511,16 +561,21 @@ def analyze_command(symbol, timeframe):
         f"Flat: `{data.get('flat_probability')}%`",
     ]
 
+    if summary:
+        result_lines.append("")
+        result_lines.append(f"💡 *Why:* {summary}")
+
     if data.get("entry"):
-        result.extend([
+        result_lines.extend([
             "",
             f"Entry: `{data['entry']}`",
             f"SL: `{data['sl']}`",
             f"TP1: `{data['tp1']}`",
             f"TP2: `{data.get('tp2')}`",
+            f"RR: `{data.get('rr')}`",
         ])
 
-    return "\n".join(result)
+    return "\n".join(result_lines)
 
 
 def analyze_scan(symbol):
@@ -552,6 +607,7 @@ def analyze_scan(symbol):
         "tp1": float(data["tp1"]),
         "tp2": float(data.get("tp2", data["tp1"])),
         "rr": rr,
+        "reason": data.get("reason", ""),
     }
 
 
@@ -562,7 +618,7 @@ def analyze_scan(symbol):
 def cmd_start(update, context: CallbackContext):
     global SCAN_ENABLED
     SCAN_ENABLED = True
-    update.message.reply_text("✅ Auto Scanner ON")
+    update.message.reply_text("✅ Auto Scanner ON (scanning every 5 min, 30 min cooldown per coin)")
 
 
 def cmd_stop(update, context: CallbackContext):
@@ -618,7 +674,7 @@ def scanner_job(context: CallbackContext):
 
         key = (sym, sig["direction"])
         last = last_signal_time.get(key)
-        if last and (now - last).total_seconds() < 1800:
+        if last and (now - last).total_seconds() < SIGNAL_COOLDOWN_SECONDS:
             continue  # 30m cooldown
 
         last_signal_time[key] = now
@@ -630,8 +686,9 @@ def scanner_job(context: CallbackContext):
                 f"Analysis only, auto-trade disabled.\n\n"
             )
 
-        context.bot.send_message(
-            OWNER_CHAT_ID,
+        reason = sig.get("reason", "").strip()
+
+        msg_lines = [
             warn +
             f"🚨 *AI SIGNAL*\n"
             f"Symbol: `{sym}`\n"
@@ -641,6 +698,14 @@ def scanner_job(context: CallbackContext):
             f"Entry: `{sig['entry']}`\n"
             f"SL: `{sig['sl']}`\n"
             f"TP1: `{sig['tp1']}`",
+        ]
+
+        if reason:
+            msg_lines.append(f"\n💡 *Why:* {reason}")
+
+        context.bot.send_message(
+            OWNER_CHAT_ID,
+            "\n".join(msg_lines),
             parse_mode="Markdown",
         )
 

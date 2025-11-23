@@ -9,7 +9,6 @@ import json
 import re
 import time
 import asyncio
-from datetime import datetime, timezone
 
 import requests
 import google.generativeai as genai
@@ -43,19 +42,21 @@ if not GEMINI_API_KEY:
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
+# Scanner behaviour
 SCAN_INTERVAL_SECONDS = 300         # background scan interval
 SIGNAL_COOLDOWN_SECONDS = 600       # 10 min cooldown per (symbol, direction)
 MIN_VOLUME = 50_000_000             # Bybit 24h turnover filter
 MIN_PROB_SCAN = 80                  # autoscan probability threshold
 MIN_RR = 1.9                        # minimum RR
 
+# Autotrade behaviour
 AUTO_LEVERAGE = 3
 AUTO_MAX_POSITIONS = 2
 
 SCAN_ENABLED = True
 SUPPORTED_BINGX = set()
 auto_open_positions = set()
-last_signal_time: dict[tuple[str, str], float] = {}
+last_signal_time = {}  # (symbol, direction) -> last timestamp
 
 
 # ============================================================
@@ -63,17 +64,11 @@ last_signal_time: dict[tuple[str, str], float] = {}
 # ============================================================
 
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(
-    GEMINI_MODEL,
-    generation_config={
-        "response_mime_type": "application/json",
-        "temperature": 0.25,
-    }
-)
+gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # simple init; arguments that exist in py-bingx 0.4+
+    # simple init for py-bingx >= 0.4
     bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
 
 
@@ -114,7 +109,7 @@ def get_bybit_symbols():
         return []
 
 
-def get_candles(symbol: str, tf: str):
+def get_candles(symbol, tf):
     """
     Returns OHLCV candles for Bybit linear futures.
     """
@@ -154,7 +149,7 @@ def get_candles(symbol: str, tf: str):
         return []
 
 
-def get_price(symbol: str):
+def get_price(symbol):
     """
     Latest price from Bybit ticker.
     """
@@ -202,9 +197,14 @@ def load_supported_bingx_symbols():
 
         symbols = set()
         for c in contracts:
-            sym = c.get("symbol") if isinstance(c, dict) else str(c)
+            if isinstance(c, dict):
+                sym = c.get("symbol")
+            else:
+                sym = str(c)
+
             if not sym:
                 continue
+
             if sym.endswith("-USDT"):
                 symbols.add(sym.replace("-USDT", "USDT"))
             elif sym.endswith("USDT"):
@@ -239,32 +239,29 @@ def get_bingx_usdt_balance():
 # BULLETPROOF GEMINI JSON EXTRACTOR
 # ============================================================
 
-def force_json(text: str):
+def force_json(text):
     """
-    Extract valid JSON from Gemini output.
-    Handles:
-    - markdown code fences ```json ... ```
-    - extra commentary before/after JSON
-    - stray markdown chars
-    Always returns a dict ({} if completely broken).
+    Extract first valid JSON object from text.
+    Last-resort fallback → {} instead of raising.
     """
     if not text:
         return {}
 
-    # Strip markdown code fences
-    text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"```", "", text)
-
-    # First try: slice between first "{" and last "}"
+    # direct JSON
     try:
-        start = text.index("{")
-        end = text.rindex("}")
-        candidate = text[start:end+1]
-        return json.loads(candidate)
+        return json.loads(text)
     except Exception:
         pass
 
-    # Second: regex { ... }
+    # bracket slice
+    try:
+        start = text.index("{")
+        end = text.rindex("}")
+        return json.loads(text[start:end + 1])
+    except Exception:
+        pass
+
+    # regex
     try:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
@@ -272,15 +269,10 @@ def force_json(text: str):
     except Exception:
         pass
 
-    # Third: try to strip non-JSON characters crudely
-    try:
-        cleaned = re.sub(r"[^\{\}\[\]0-9A-Za-z\":,\.\-\s]", "", text)
-        return json.loads(cleaned)
-    except Exception:
-        return {}
+    return {}
 
 
-def ask_gemini(prompt: str | dict):
+def ask_gemini(prompt):
     """
     Call Gemini and return parsed JSON (or {}).
     """
@@ -360,7 +352,7 @@ Return ONLY JSON:
 # MANUAL ANALYSIS
 # ============================================================
 
-async def analyze_manual(symbol: str) -> str:
+async def analyze_manual(symbol):
     symbol = symbol.upper()
     price = get_price(symbol)
     if price is None:
@@ -411,7 +403,7 @@ async def analyze_manual(symbol: str) -> str:
 
 
 # ============================================================
-# AUTOTRADE (simple always-execute version)
+# AUTOTRADE
 # ============================================================
 
 def maybe_autotrade(signal, bot):
@@ -476,7 +468,7 @@ def maybe_autotrade(signal, bot):
 # AUTOSCAN LOGIC
 # ============================================================
 
-async def analyze_signal(symbol: str):
+async def analyze_signal(symbol):
     price = get_price(symbol)
     if price is None:
         return None
@@ -612,5 +604,61 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     # Remove leading "/" and any arguments after a space
-    if text.startswith("/")
-::contentReference[oaicite:0]{index=0}
+    if text.startswith("/"):
+        symbol = text[1:].split()[0].upper()
+    else:
+        symbol = text.replace("/", "").split()[0].upper()
+
+    if not symbol.endswith("USDT"):
+        await update.message.reply_text(
+            "Send coin like: `/btcusdt` or `/ethusdt`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(f"⏳ Analysing {symbol}...")
+
+    try:
+        result = await analyze_manual(symbol)
+    except Exception as e:
+        result = f"❌ Error analysing {symbol}: {e}"
+
+    await update.message.reply_markdown(result)
+
+
+# ============================================================
+# POST_INIT + MAIN
+# ============================================================
+
+async def post_init(app):
+    # load BingX symbols once
+    await asyncio.to_thread(load_supported_bingx_symbols)
+    # start scanner loop
+    app.create_task(scanner_loop(app))
+
+
+def main():
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("stop", cmd_stop))
+
+    # Any other command → treated as coin, e.g. /btcusdt
+    application.add_handler(
+        MessageHandler(
+            filters.COMMAND & ~filters.Regex(r"^/(start|stop)$"),
+            handle_pair,
+        )
+    )
+
+    print("Bot running...")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()

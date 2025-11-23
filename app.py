@@ -51,7 +51,11 @@ MIN_PROB_MANUAL = 75
 MIN_PROB_SCAN = 85
 MIN_RR = 2.1
 
-DEFAULT_TIMEFRAMES = ["5m","15m","30m","1h","2h","4h","6h","12h","1d","1w"]
+DEFAULT_TIMEFRAMES = [
+    "5m","15m","30m","1h","2h","4h",
+    "6h","12h","1d","1w"
+]
+
 SCAN_TIMEFRAMES = ["15m","1h","4h"]
 
 AUTO_MAX_POSITIONS = 2
@@ -59,7 +63,7 @@ AUTO_LEVERAGE = 3.0
 
 last_signal_time = {}
 auto_open_positions = set()
-SUPPORTED_BINGX = set()  # auto-filled on startup
+SUPPORTED_BINGX = set()  # Will auto-detect
 
 
 # ============================================================
@@ -74,18 +78,20 @@ if BINGX_API_KEY and BINGX_API_SECRET:
 
 
 # ============================================================
-# AUTO-DETECT BINGX FUTURES SUPPORTED SYMBOLS
+# AUTO-DETECT SUPPORTED BINGX USDT-M FUTURES SYMBOLS
 # ============================================================
 
 def load_supported_bingx_symbols():
     """
-    Pull all USDT-M futures symbols from BingX automatically.
+    Automatically load ALL USDT-M perpetual futures symbols from BingX.
     """
     global SUPPORTED_BINGX
     try:
         data = bingx.swap_v2_get_contracts()
         lst = data.get("data", {}).get("contracts", [])
-        SUPPORTED_BINGX = {c["symbol"].replace("-USDT","USDT") for c in lst}
+        SUPPORTED_BINGX = {
+            c["symbol"].replace("-USDT", "USDT") for c in lst
+        }
         print("Supported BingX symbols loaded:", SUPPORTED_BINGX)
     except Exception as e:
         print("Failed loading supported BingX symbols:", e)
@@ -93,7 +99,7 @@ def load_supported_bingx_symbols():
 
 
 # ============================================================
-# MARKET DATA SOURCES
+# MARKET DATA SOURCES (TRIPLE FALLBACK)
 # ============================================================
 
 BINANCE_ENDPOINTS = [
@@ -105,7 +111,7 @@ OKX_ENDPOINT = "https://www.okx.com"
 
 
 # ============================================================
-# UNIVERSAL MARKET DATA CALLS
+# UNIVERSAL DATA FETCHERS
 # ============================================================
 
 def fetch_binance(path, params=None):
@@ -117,6 +123,7 @@ def fetch_binance(path, params=None):
             try:
                 r = requests.get(url, params=params, timeout=10)
 
+                # Retry on anti-bot / rate-limit / server issues
                 if r.status_code in [418,429,451,403] or r.status_code >= 500:
                     time.sleep(1.2 * (attempt+1))
                     continue
@@ -130,9 +137,13 @@ def fetch_binance(path, params=None):
 
 
 def fetch_okx(symbol, interval):
+    """
+    Convert ETHUSDT → ETH-USDT-SWAP
+    """
     try:
+        okx_symbol = symbol.replace("USDT", "-USDT-SWAP")
         url = f"{OKX_ENDPOINT}/api/v5/market/candles"
-        r = requests.get(url, params={"instId": f"{symbol}-USDT-SWAP", "bar": interval}, timeout=10)
+        r = requests.get(url, params={"instId": okx_symbol, "bar": interval}, timeout=10)
         r.raise_for_status()
         raw = r.json()
 
@@ -151,8 +162,14 @@ def fetch_okx(symbol, interval):
 
 
 def fetch_bingx(symbol, interval):
+    """
+    Convert Binance symbol → BingX symbol:
+    BTCUSDT → BTC-USDT
+    """
     try:
-        data = bingx.market_get_candles(symbol, interval, 100)
+        bingx_symbol = symbol.replace("USDT", "-USDT")
+        data = bingx.market_get_candles(bingx_symbol, interval, 100)
+
         candles = [{
             "open_time": c["t"],
             "open": float(c["o"]),
@@ -168,22 +185,25 @@ def fetch_bingx(symbol, interval):
 
 
 def get_klines(symbol, interval):
-    # 1️⃣ BingX
+    """
+    MASTER candle function with 3-level fallback.
+    """
+
+    # 1️⃣ BingX (best quality)
     c = fetch_bingx(symbol, interval)
     if c:
         return c
 
-    # 2️⃣ OKX
+    # 2️⃣ OKX (excellent fallback)
     c = fetch_okx(symbol, interval)
     if c:
         return c
 
-    # 3️⃣ Binance
-    raw = fetch_binance("/fapi/v1/klines", {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": 100
-    })
+    # 3️⃣ Binance (final fallback)
+    raw = fetch_binance(
+        "/fapi/v1/klines",
+        {"symbol": symbol, "interval": interval, "limit": 100}
+    )
 
     candles = [{
         "open_time": c[0],
@@ -198,6 +218,9 @@ def get_klines(symbol, interval):
 
 
 def get_top_symbols():
+    """
+    Pull top USDT pairs by 24h volume from Binance.
+    """
     try:
         data = fetch_binance("/fapi/v1/ticker/24hr")
     except:
@@ -222,35 +245,78 @@ def build_snapshot(symbol, timeframes):
     current_price = None
 
     for tf in timeframes:
-        klines = get_klines(symbol, tf)
+        try:
+            klines = get_klines(symbol, tf)
+        except:
+            klines = None
+
         snapshot[tf] = klines
         if klines:
             current_price = klines[-1]["close"]
 
     return snapshot, current_price
-
-
 # ============================================================
 # GEMINI PROMPTS
 # ============================================================
 
 def prompt_for_pair(symbol, timeframe, snapshot, price):
     return f"""
-Act as a world-class crypto futures expert...
-(keep your previous full prompt here)
-Current price: {price}
+You are a world-class crypto futures analyst with deep knowledge of:
+- Price action
+- Support/resistance
+- Trendlines
+- Chart patterns
+- RSI / MACD / EMA confluence
+- Reversal signals (hammer, doji, engulfing)
+- Liquidity sweep behavior
+
+Your job is to analyze the given symbol across the provided timeframes and output:
+
+1. upside_probability (0–100)
+2. downside_probability (0–100)
+3. flat_probability (0–100)
+4. direction: "long" or "short" or "flat"
+5. entry
+6. sl
+7. tp1
+8. tp2
+9. rr (risk-reward ratio)
+
+Rules:
+- Output *only* valid JSON.
+- Entry/SL/TP must be realistic based on price action.
+- SL should be at a real key level (not random).
+- RR must be >= 1.8 for strong signals.
+
+Symbol: {symbol}
+Current Price: {price}
 Snapshot: {json.dumps(snapshot)}
-Timeframe: {timeframe}
-Return clean JSON only.
+Timeframe Requested: {timeframe}
+Return ONLY JSON.
 """
 
 
 def prompt_for_scan(symbol, snapshot, price):
     return f"""
-You are an ultra-fast crypto futures scanner...
-(keep your previous full scanner prompt here)
+You are an ultra-fast crypto futures AI scanner. 
+You scan a symbol and produce only the ESSENTIAL JSON with:
+
+- direction: "long" / "short"
+- probability (0–100)
+- entry
+- sl
+- tp1
+- tp2
+- rr
+
+Rules:
+- output JSON ONLY.
+- probability must be realistic based on market structure.
+- rr must be >= 2.1 for strong signals.
+- SL must be at a key level, not random.
+
 Symbol: {symbol}
-Price: {price}
+Current Price: {price}
 Snapshot: {json.dumps(snapshot)}
 Return JSON only.
 """
@@ -261,7 +327,10 @@ Return JSON only.
 # ============================================================
 
 def call_gemini(prompt, model):
-    r = gemini_client.models.generate_content(model=model, contents=prompt)
+    r = gemini_client.models.generate_content(
+        model=model,
+        contents=prompt
+    )
     return r.text
 
 
@@ -275,7 +344,7 @@ def extract_json(text):
 
 
 # ============================================================
-# BINGX BALANCE
+# BINGX BALANCE (CORRECT ENDPOINT FOR USDT-M FUTURES)
 # ============================================================
 
 def get_bingx_usdt_balance():
@@ -292,10 +361,11 @@ def get_bingx_usdt_balance():
 
 
 # ============================================================
-# AUTO-TRADE
+# AUTO-TRADE EXECUTION
 # ============================================================
 
 def binance_to_bingx_symbol(symbol):
+    """BTCUSDT -> BTC-USDT"""
     return symbol.replace("USDT", "-USDT")
 
 
@@ -304,11 +374,12 @@ def maybe_auto_trade(sig, context):
 
     symbol = sig["symbol"]
 
+    # Skip auto-trading for unsupported symbols
     if symbol not in SUPPORTED_BINGX:
         context.bot.send_message(
             OWNER_CHAT_ID,
             f"ℹ️ {symbol} is not supported on BingX.\n"
-            f"Using Binance data only. Auto-trade disabled."
+            f"Using Binance/OKX only. Auto-trade disabled."
         )
         return
 
@@ -317,13 +388,17 @@ def maybe_auto_trade(sig, context):
 
     balance = get_bingx_usdt_balance()
     if not balance or balance <= 0:
-        context.bot.send_message(OWNER_CHAT_ID, "⚠️ Auto-trade skipped: balance unavailable.")
+        context.bot.send_message(
+            OWNER_CHAT_ID,
+            "⚠️ Auto-trade skipped: USDT balance unavailable."
+        )
         return
 
     entry = sig["entry"]
     if entry <= 0:
         return
 
+    # Use full balance at 3x lev, but split for max 2 positions
     total_notional = balance * AUTO_LEVERAGE
     qty = (total_notional / AUTO_MAX_POSITIONS) / entry
 
@@ -347,7 +422,9 @@ def maybe_auto_trade(sig, context):
             f"Symbol: {bingx_symbol}\n"
             f"Side: {side}\n"
             f"Qty: {qty:.6f}\n"
-            f"Entry: {entry}\nSL: {sig['sl']}\nTP1: {sig['tp1']}"
+            f"Entry: {entry}\n"
+            f"SL: {sig['sl']}\n"
+            f"TP1: {sig['tp1']}"
         )
 
     except Exception as e:
@@ -355,7 +432,7 @@ def maybe_auto_trade(sig, context):
 
 
 # ============================================================
-# ANALYSIS
+# ANALYSIS COMMAND
 # ============================================================
 
 def analyze_command(symbol, timeframe):
@@ -365,19 +442,22 @@ def analyze_command(symbol, timeframe):
     if price is None:
         return f"❌ Could not fetch candles for {symbol}"
 
-    raw = call_gemini(prompt_for_pair(symbol, timeframe, snapshot, price), GEMINI_MODEL_MANUAL)
+    prompt = prompt_for_pair(symbol, timeframe, snapshot, price)
+    raw = call_gemini(prompt, GEMINI_MODEL_MANUAL)
     data = extract_json(raw)
 
     if not data:
-        return "❌ JSON parsing error.\n" + raw[:800]
+        return "❌ JSON parsing error.\n" + raw[:500]
 
     warn = ""
     if symbol not in SUPPORTED_BINGX:
-        warn = f"ℹ️ {symbol} is not supported on BingX.\nUsing Binance data only. Auto-trade disabled.\n\n"
+        warn = (
+            f"ℹ️ {symbol} is not supported on BingX.\n"
+            f"Using multi-exchange data. Auto-trade disabled.\n\n"
+        )
 
     result = [
-        warn +
-        f"📊 *{symbol} Analysis*",
+        warn + f"📊 *{symbol} Analysis*",
         f"Price: `{price}`",
         f"Direction: *{data.get('direction')}*",
         f"Upside: `{data.get('upside_probability')}%`",
@@ -397,13 +477,19 @@ def analyze_command(symbol, timeframe):
     return "\n".join(result)
 
 
+# ============================================================
+# SCANNER SIGNAL GENERATION
+# ============================================================
+
 def analyze_scan(symbol):
     snapshot, price = build_snapshot(symbol, SCAN_TIMEFRAMES)
     if price is None:
         return None
 
-    raw = call_gemini(prompt_for_scan(symbol, snapshot, price), GEMINI_MODEL_SCANNER)
+    prompt = prompt_for_scan(symbol, snapshot, price)
+    raw = call_gemini(prompt, GEMINI_MODEL_SCANNER)
     data = extract_json(raw)
+
     if not data:
         return None
 
@@ -423,8 +509,6 @@ def analyze_scan(symbol):
         "tp2": float(data.get("tp2", data["tp1"])),
         "rr": rr,
     }
-
-
 # ============================================================
 # TELEGRAM HANDLERS
 # ============================================================
@@ -434,10 +518,12 @@ def start(update, context):
     SCAN_ENABLED = True
     update.message.reply_text("✅ Auto Scanner ON")
 
+
 def stop(update, context):
     global SCAN_ENABLED
     SCAN_ENABLED = False
     update.message.reply_text("⏹ Auto Scanner OFF")
+
 
 def handle_pair(update, context):
     msg = update.message.text.strip()
@@ -485,6 +571,7 @@ def scanner_job(context):
         key = (sym, sig["direction"])
         last = last_signal_time.get(key)
 
+        # Anti-spam: 30m cooldown per direction per symbol
         if last and (now - last).total_seconds() < 1800:
             continue
 
@@ -492,7 +579,11 @@ def scanner_job(context):
 
         warn = ""
         if sym not in SUPPORTED_BINGX:
-            warn = f"ℹ️ {sym} is not supported on BingX.\nUsing Binance data only. Auto-trade disabled.\n\n"
+            warn = (
+                f"ℹ️ {sym} is not supported on BingX.\n"
+                f"Using multi-exchange candles only.\n"
+                f"Auto-trade disabled.\n\n"
+            )
 
         context.bot.send_message(
             OWNER_CHAT_ID,
@@ -508,14 +599,16 @@ def scanner_job(context):
             parse_mode="Markdown"
         )
 
+        # Attempt auto trade
         maybe_auto_trade(sig, context)
 
 
 # ============================================================
-# MAIN
+# MAIN FUNCTION
 # ============================================================
 
 def main():
+    # Load supported futures first
     load_supported_bingx_symbols()
 
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)

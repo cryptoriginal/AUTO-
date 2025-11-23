@@ -42,14 +42,13 @@ if not GEMINI_API_KEY:
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-# Scanner behaviour
-SCAN_INTERVAL_SECONDS = 300         # background scan interval
-SIGNAL_COOLDOWN_SECONDS = 600       # 10 min cooldown per (symbol, direction)
-MIN_VOLUME = 50_000_000             # Bybit 24h turnover filter
-MIN_PROB_SCAN = 80                  # autoscan probability threshold
-MIN_RR = 1.9                        # minimum RR
+# scanner / trade settings
+SCAN_INTERVAL_SECONDS = 300          # background scan interval
+SIGNAL_COOLDOWN_SECONDS = 600        # 10 min cooldown per (symbol, direction)
+MIN_VOLUME = 50_000_000              # Bybit 24h turnover filter
+MIN_PROB_SCAN = 80                   # autoscan probability threshold
+MIN_RR = 1.9                         # minimum RR
 
-# Autotrade behaviour
 AUTO_LEVERAGE = 3
 AUTO_MAX_POSITIONS = 2
 
@@ -68,8 +67,15 @@ gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # simple init for py-bingx >= 0.4
-    bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
+    # Try a few common constructor styles to be tolerant to versions
+    try:
+        bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
+    except TypeError:
+        try:
+            bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET, timestamp="local")
+        except Exception as e:
+            print("BingxAPI init error:", e)
+            bingx = None
 
 
 # ============================================================
@@ -98,7 +104,8 @@ def get_bybit_symbols():
         data = r.json()
         items = data.get("result", {}).get("list", []) or []
         filtered = [
-            it for it in items
+            it
+            for it in items
             if it.get("symbol", "").endswith("USDT")
             and float(it.get("turnover24h") or 0) >= MIN_VOLUME
         ]
@@ -109,7 +116,7 @@ def get_bybit_symbols():
         return []
 
 
-def get_candles(symbol, tf):
+def get_candles(symbol: str, tf: str):
     """
     Returns OHLCV candles for Bybit linear futures.
     """
@@ -149,7 +156,7 @@ def get_candles(symbol, tf):
         return []
 
 
-def get_price(symbol):
+def get_price(symbol: str):
     """
     Latest price from Bybit ticker.
     """
@@ -185,36 +192,44 @@ def load_supported_bingx_symbols():
 
     try:
         data = bingx.get_all_contracts()
-        if isinstance(data, dict):
-            contracts = (
-                data.get("data", {}).get("contracts")
-                or data.get("data")
-                or data.get("contracts")
-                or []
-            )
-        else:
-            contracts = data or []
-
-        symbols = set()
-        for c in contracts:
-            if isinstance(c, dict):
-                sym = c.get("symbol")
-            else:
-                sym = str(c)
-
-            if not sym:
-                continue
-
-            if sym.endswith("-USDT"):
-                symbols.add(sym.replace("-USDT", "USDT"))
-            elif sym.endswith("USDT"):
-                symbols.add(sym)
-
-        SUPPORTED_BINGX = symbols
-        print(f"[BINGX] Loaded {len(SUPPORTED_BINGX)} symbols")
+    except AttributeError:
+        # fallback to older method names if needed
+        try:
+            data = bingx.swap_v2_get_contracts()
+        except Exception as e:
+            print("load_supported_bingx_symbols error:", e)
+            SUPPORTED_BINGX = set()
+            return
     except Exception as e:
         print("load_supported_bingx_symbols error:", e)
         SUPPORTED_BINGX = set()
+        return
+
+    if isinstance(data, dict):
+        contracts = (
+            data.get("data", {}).get("contracts")
+            or data.get("data")
+            or data.get("contracts")
+            or []
+        )
+    else:
+        contracts = data or []
+
+    symbols = set()
+    for c in contracts:
+        if isinstance(c, dict):
+            sym = c.get("symbol") or c.get("pair")
+        else:
+            sym = str(c)
+        if not sym:
+            continue
+        if sym.endswith("-USDT"):
+            symbols.add(sym.replace("-USDT", "USDT"))
+        elif sym.endswith("USDT"):
+            symbols.add(sym)
+
+    SUPPORTED_BINGX = symbols
+    print(f"[BINGX] Loaded {len(SUPPORTED_BINGX)} symbols")
 
 
 def get_bingx_usdt_balance():
@@ -224,7 +239,11 @@ def get_bingx_usdt_balance():
     if not bingx:
         return None
     try:
-        info = bingx.get_perpetual_balance()
+        try:
+            info = bingx.get_perpetual_balance()
+        except AttributeError:
+            info = bingx.swap_v2_get_balance()
+
         bal = (info.get("data") or {}).get("balance") or {}
         avail = bal.get("availableMargin") or bal.get("balance")
         if avail is None:
@@ -236,34 +255,45 @@ def get_bingx_usdt_balance():
 
 
 # ============================================================
-# BULLETPROOF GEMINI JSON EXTRACTOR
+# GEMINI HELPERS — BULLETPROOF JSON + TEXT FALLBACK
 # ============================================================
 
-def force_json(text):
+def force_json(text: str):
     """
     Extract first valid JSON object from text.
-    Last-resort fallback → {} instead of raising.
+    Very defensive: tries direct parse, bracket slicing, regex.
+    If everything fails, returns {} instead of raising.
     """
     if not text:
         return {}
 
-    # direct JSON
+    # try direct JSON first
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # bracket slice
+    # strip markdown fences like ```json ... ```
+    cleaned = re.sub(r"```(?:json)?", "", text)
+    cleaned = cleaned.replace("```", "")
+
+    # try again on cleaned
     try:
-        start = text.index("{")
-        end = text.rindex("}")
-        return json.loads(text[start:end + 1])
+        return json.loads(cleaned)
     except Exception:
         pass
 
-    # regex
+    # bracket slice
     try:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
+        start = cleaned.index("{")
+        end = cleaned.rindex("}")
+        return json.loads(cleaned[start:end + 1])
+    except Exception:
+        pass
+
+    # regex fallback
+    try:
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if m:
             return json.loads(m.group())
     except Exception:
@@ -272,17 +302,30 @@ def force_json(text):
     return {}
 
 
-def ask_gemini(prompt):
+def ask_gemini_json(prompt: str):
     """
     Call Gemini and return parsed JSON (or {}).
     """
     try:
         resp = gemini_model.generate_content(prompt)
-        txt = resp.text or ""
+        txt = (resp.text or "").strip()
         return force_json(txt)
     except Exception as e:
-        print("Gemini error:", e)
+        print("Gemini JSON error:", e)
         return {}
+
+
+def ask_gemini_text(prompt: str) -> str:
+    """
+    Call Gemini and return plain text summary (no JSON).
+    Used as fallback when JSON is unusable.
+    """
+    try:
+        resp = gemini_model.generate_content(prompt)
+        return (resp.text or "").strip()
+    except Exception as e:
+        print("Gemini text error:", e)
+        return ""
 
 
 # ============================================================
@@ -349,10 +392,10 @@ Return ONLY JSON:
 
 
 # ============================================================
-# MANUAL ANALYSIS
+# MANUAL ANALYSIS ( /btcusdt etc. )
 # ============================================================
 
-async def analyze_manual(symbol):
+async def analyze_manual(symbol: str) -> str:
     symbol = symbol.upper()
     price = get_price(symbol)
     if price is None:
@@ -365,10 +408,29 @@ async def analyze_manual(symbol):
     }
 
     prompt = build_manual_prompt(symbol, snapshot, price)
-    data = await asyncio.to_thread(ask_gemini, prompt)
+    data = await asyncio.to_thread(ask_gemini_json, prompt)
 
+    # If Gemini didn't give usable JSON, fall back to plain text explanation
     if not data:
-        return "❌ Gemini JSON error."
+        fallback_prompt = f"""
+You are a top crypto trader.
+
+Give a short 3–5 line trading view for {symbol} at price {price}.
+Use the idea of trend, key support/resistance, and whether it is better
+to look for longs, shorts or stay flat. Do NOT return JSON, just text.
+"""
+        text = await asyncio.to_thread(ask_gemini_text, fallback_prompt)
+        if not text:
+            return (
+                f"❌ AI could not generate a structured analysis for {symbol} right now.\n"
+                f"Please try again in a few seconds."
+            )
+
+        return (
+            f"📊 *{symbol} Analysis (fallback)*\n"
+            f"Price: `{price}`\n\n"
+            f"{text}"
+        )
 
     direction = data.get("direction", "flat")
     summary = data.get("summary", "-")
@@ -403,7 +465,7 @@ async def analyze_manual(symbol):
 
 
 # ============================================================
-# AUTOTRADE
+# AUTOTRADE (simple always-execute version)
 # ============================================================
 
 def maybe_autotrade(signal, bot):
@@ -424,7 +486,10 @@ def maybe_autotrade(signal, bot):
     balance = get_bingx_usdt_balance()
     if not balance or balance <= 0:
         if OWNER_CHAT_ID:
-            bot.send_message(OWNER_CHAT_ID, "⚠️ AutoTrade skipped: no USDT balance.")
+            bot.send_message(
+                OWNER_CHAT_ID,
+                "⚠️ AutoTrade skipped: BingX USDT balance unavailable or zero.",
+            )
         return
 
     entry = signal["entry"]
@@ -438,13 +503,27 @@ def maybe_autotrade(signal, bot):
     side = "LONG" if direction == "long" else "SHORT"
 
     try:
-        bingx.open_market_order(
-            bingx_symbol,
-            side,
-            qty,
-            tp=str(signal["tp1"]),
-            sl=str(signal["stop"]),
-        )
+        # try modern open_market_order
+        try:
+            bingx.open_market_order(
+                bingx_symbol,
+                side,
+                qty,
+                tp=str(signal["tp1"]),
+                sl=str(signal["stop"]),
+            )
+        except AttributeError:
+            # fallback to older swap_v2_place_order style if needed
+            bingx.swap_v2_place_order(
+                symbol=bingx_symbol,
+                side="BUY" if side == "LONG" else "SELL",
+                positionSide="LONG" if side == "LONG" else "SHORT",
+                type="MARKET",
+                quantity=str(qty),
+                takeProfit=str(signal["tp1"]),
+                stopLoss=str(signal["stop"]),
+            )
+
         auto_open_positions.add(sym)
 
         if OWNER_CHAT_ID:
@@ -468,7 +547,7 @@ def maybe_autotrade(signal, bot):
 # AUTOSCAN LOGIC
 # ============================================================
 
-async def analyze_signal(symbol):
+async def analyze_signal(symbol: str):
     price = get_price(symbol)
     if price is None:
         return None
@@ -480,7 +559,7 @@ async def analyze_signal(symbol):
     }
 
     prompt = build_scan_prompt(symbol, candles, price)
-    data = await asyncio.to_thread(ask_gemini, prompt)
+    data = await asyncio.to_thread(ask_gemini_json, prompt)
     if not data:
         return None
 
@@ -542,8 +621,8 @@ async def scan_once(app):
             warn = f"ℹ️ {sym} not supported on BingX → autotrade OFF.\n\n"
 
         msg = (
-            warn +
-            f"🚨 *AI SIGNAL*\n"
+            warn
+            + f"🚨 *AI SIGNAL*\n"
             f"Symbol: `{sym}`\n"
             f"Direction: `{sig['direction']}`\n"
             f"Probability: `{sig['probability']}%`\n"
@@ -591,7 +670,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SCAN_ENABLED
     SCAN_ENABLED = False
-    await update.message.reply_text("⏹ Auto-scanner OFF. Manual analysis still works.")
+    await update.message.reply_text(
+        "⏹ Auto-scanner OFF. Manual analysis still works."
+    )
 
 
 async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,8 +692,7 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not symbol.endswith("USDT"):
         await update.message.reply_text(
-            "Send coin like: `/btcusdt` or `/ethusdt`",
-            parse_mode="Markdown",
+            "Send coin like: `/btcusdt` or `/ethusdt`", parse_mode="Markdown"
         )
         return
 
@@ -631,7 +711,7 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def post_init(app):
-    # load BingX symbols once
+    # load BingX symbols once (in background thread)
     await asyncio.to_thread(load_supported_bingx_symbols)
     # start scanner loop
     app.create_task(scanner_loop(app))

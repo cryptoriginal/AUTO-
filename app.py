@@ -51,9 +51,9 @@ SCAN_TIMEFRAMES = ["15m", "1h", "4h"]
 AUTO_MAX_POSITIONS = 2
 AUTO_LEVERAGE = 3.0
 
-last_signal_time = {}                 # (symbol, dir) -> datetime
-auto_open_positions = set()           # track symbols with open auto-positions
-SUPPORTED_BINGX = set()               # holds symbols like "BTCUSDT"
+last_signal_time: dict[tuple[str, str], datetime] = {}
+auto_open_positions: set[str] = set()
+SUPPORTED_BINGX: set[str] = set()     # holds symbols like "BTCUSDT"
 
 # ============================================================
 # CLIENTS
@@ -88,23 +88,28 @@ def from_bingx_symbol(symbol: str) -> str:
 
 
 # ============================================================
-# LOAD SUPPORTED BINGX FUTURES
+# LOAD SUPPORTED BINGX FUTURES (USDT-M)
 # ============================================================
 
 def load_supported_bingx_symbols():
-    """Fill SUPPORTED_BINGX with symbols like 'BTCUSDT'."""
+    """
+    Fill SUPPORTED_BINGX with symbols like 'BTCUSDT' using
+    market_get_ticker_all() (available in py-bingx 0.4).
+    """
     global SUPPORTED_BINGX
+
     if not bingx:
         SUPPORTED_BINGX = set()
         return
+
     try:
-        data = bingx.swap_v2_get_contracts()
-        contracts = data.get("data", {}).get("contracts", [])
-        symbols = set()
-        for c in contracts:
-            sym = c.get("symbol", "")
-            if sym.endswith("-USDT"):
-                symbols.add(from_bingx_symbol(sym))
+        data = bingx.market_get_ticker_all()
+        lst = data.get("data", [])
+        symbols: set[str] = set()
+        for item in lst:
+            sym_bx = item.get("symbol", "")
+            if sym_bx.endswith("-USDT"):
+                symbols.add(from_bingx_symbol(sym_bx))
         SUPPORTED_BINGX = symbols
         print(f"Loaded {len(SUPPORTED_BINGX)} BingX USDT-M futures symbols.")
     except Exception as e:
@@ -237,11 +242,6 @@ Return STRICT JSON ONLY:
   "rr": float
 }}
 
-Rules:
-- If market is choppy / unclear, set direction="flat".
-- If suggesting a trade, rr must be >= 1.8 and SL must be a logical key level
-  (swing high/low or strong S/R).
-
 Symbol: {symbol}
 Requested timeframe: {timeframe}
 Current price: {price}
@@ -334,8 +334,7 @@ async def auto_trade(sig: dict, bot):
         return
 
     symbol_std = sig["symbol"]    # "SUIUSDT"
-    if symbol_std not in SUPPORTED_BINGX:
-        # skip quietly; we only auto-trade supported BingX pairs
+    if SUPPORTED_BINGX and symbol_std not in SUPPORTED_BINGX:
         return
 
     if len(auto_open_positions) >= AUTO_MAX_POSITIONS:
@@ -592,7 +591,7 @@ async def post_init(app):
 # MAIN
 # ============================================================
 
-async def main():
+def main():
     load_supported_bingx_symbols()
 
     application = (
@@ -610,10 +609,10 @@ async def main():
     coin_command_filter = filters.COMMAND & ~filters.Regex(r"^/(start|stop)$")
     application.add_handler(MessageHandler(coin_command_filter, handle_pair))
 
-    # run bot
-    await application.run_polling()
+    # PTB v20 manages its own event loop here (no asyncio.run)
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 

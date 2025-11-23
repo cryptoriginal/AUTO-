@@ -3,7 +3,6 @@ import json
 import asyncio
 from datetime import datetime, timezone
 
-import requests
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import (
@@ -32,7 +31,7 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY")
 
-# Gemini model name – you can override in Render env as GEMINI_MODEL
+# You can override this in Render env as GEMINI_MODEL
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # ============================================================
@@ -41,9 +40,9 @@ GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 SCAN_ENABLED = True
 SCAN_INTERVAL_SECONDS = 300            # 5 minutes
-SIGNAL_COOLDOWN_SECONDS = 600          # 10 minutes cooldown
+SIGNAL_COOLDOWN_SECONDS = 600          # 10 minutes
 
-MIN_VOLUME = 50_000_000                # BingX 24h quote volume filter
+MIN_VOLUME = 50_000_000                # 24h quote volume filter
 MIN_PROB_MANUAL = 80                   # manual analysis threshold
 MIN_PROB_SCAN = 80                     # autoscan threshold
 MIN_RR = 1.9                           # minimum RR
@@ -76,18 +75,18 @@ if BINGX_API_KEY and BINGX_API_SECRET:
 # SYMBOL HELPERS
 # ============================================================
 
-def to_bingx_symbol(symbol: str) -> str:
-    """Convert 'SUIUSDT' -> 'SUI-USDT'."""
-    if symbol.endswith("USDT"):
-        return symbol.replace("USDT", "-USDT")
-    return symbol
+def std_to_bingx(symbol_std: str) -> str:
+    """User sends BTCUSDT, BingX expects BTC-USDT."""
+    if symbol_std.endswith("USDT"):
+        return symbol_std[:-4] + "-USDT"
+    return symbol_std
 
 
-def from_bingx_symbol(symbol: str) -> str:
-    """Convert 'SUI-USDT' -> 'SUIUSDT'."""
-    if symbol.endswith("-USDT"):
-        return symbol.replace("-USDT", "USDT")
-    return symbol
+def bingx_to_std(symbol_bx: str) -> str:
+    """BingX BTC-USDT -> BTCUSDT."""
+    if symbol_bx.endswith("-USDT"):
+        return symbol_bx.replace("-USDT", "USDT")
+    return symbol_bx
 
 
 # ============================================================
@@ -112,7 +111,7 @@ def load_supported_bingx_symbols():
         for item in lst:
             sym_bx = item.get("symbol", "")
             if sym_bx.endswith("-USDT"):
-                symbols.add(from_bingx_symbol(sym_bx))
+                symbols.add(bingx_to_std(sym_bx))
         SUPPORTED_BINGX = symbols
         print(f"[INIT] Loaded {len(SUPPORTED_BINGX)} BingX USDT-M futures symbols.")
     except Exception as e:
@@ -121,18 +120,19 @@ def load_supported_bingx_symbols():
 
 
 # ============================================================
-# BINGX MARKET DATA (ONLY)
+# BINGX MARKET DATA
 # ============================================================
 
 def fetch_bingx_candles(symbol_std: str, interval: str):
     """
-    Use py-bingx 0.4: swap_v2_get_kline(symbol, interval, limit)
+    Uses py-bingx 0.4: swap_v2_get_kline(symbol, interval, limit)
+    symbol_std: BTCUSDT
     """
     if not bingx:
         return None
 
     try:
-        sym_bx = to_bingx_symbol(symbol_std)
+        sym_bx = std_to_bingx(symbol_std)
         data = bingx.swap_v2_get_kline(symbol=sym_bx, interval=interval, limit=120)
         candles = data.get("data", [])
         if not candles:
@@ -164,7 +164,7 @@ def get_bingx_price(symbol_std: str):
     if not bingx:
         return None
     try:
-        sym_bx = to_bingx_symbol(symbol_std)
+        sym_bx = std_to_bingx(symbol_std)
         data = bingx.swap_v2_get_price(symbol=sym_bx)
         return float(data.get("data", {}).get("price"))
     except Exception as e:
@@ -191,7 +191,7 @@ def get_top_bingx_symbols():
         sym_bx = item.get("symbol", "")
         if not sym_bx.endswith("-USDT"):
             continue
-        sym_std = from_bingx_symbol(sym_bx)
+        sym_std = bingx_to_std(sym_bx)
         quote_vol = float(item.get("quoteVolume", 0) or 0)
         if quote_vol >= MIN_VOLUME:
             filtered.append((sym_std, quote_vol))
@@ -229,7 +229,7 @@ def prompt_manual(symbol, timeframe, snapshot, price):
     return f"""
 You are a world-class crypto futures trader.
 
-Use ONLY this JSON format (no extra text):
+Use ONLY this JSON format (no explanation text):
 
 {{
   "direction": "long" or "short" or "flat",
@@ -245,7 +245,7 @@ Use ONLY this JSON format (no extra text):
 }}
 
 Rules:
-- Data is only from BingX futures OHLCV.
+- Data is only BingX futures OHLCV (multi-timeframe).
 - Focus on: VWAP reclaims/rejections, fixed range volume profile
   from recent swing high to swing low, key support/resistance,
   trend structure (HH/HL vs LH/LL), and reversal candles.
@@ -257,7 +257,7 @@ Rules:
 Symbol: {symbol}
 Requested timeframe: {timeframe}
 Current price: {price}
-Snapshot (JSON HLCV): {json.dumps(snapshot)}
+Snapshot (JSON OHLCV): {json.dumps(snapshot)}
 """
 
 
@@ -278,7 +278,7 @@ Return STRICT JSON ONLY:
 }}
 
 Rules:
-- Data is BingX-only OHLCV.
+- Data is only BingX OHLCV.
 - Focus heavily on VWAP + fixed range volume profile,
   key S/R and reversal candles at those levels.
 - Only output a signal if probability >= {MIN_PROB_SCAN}
@@ -287,7 +287,7 @@ Rules:
 
 Symbol: {symbol}
 Current price: {price}
-Snapshot (JSON HLCV): {json.dumps(snapshot)}
+Snapshot (JSON OHLCV): {json.dumps(snapshot)}
 """
 
 
@@ -310,7 +310,7 @@ def extract_json(text: str):
         return json.loads(js)
     except Exception as e:
         print("extract_json error:", e)
-        print("GEMINI RAW RESPONSE:\n", text[:1000])
+        print("GEMINI RAW RESPONSE (trimmed):\n", text[:800])
         return None
 
 
@@ -367,7 +367,7 @@ async def auto_trade(sig: dict, bot):
     qty = (total_notional / AUTO_MAX_POSITIONS) / entry
 
     side = "LONG" if sig["direction"] == "long" else "SHORT"
-    symbol_bx = to_bingx_symbol(symbol_std)
+    symbol_bx = std_to_bingx(symbol_std)
 
     try:
         _order = bingx.open_market_order(
@@ -470,7 +470,7 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text.strip()
     parts = msg.split()
 
-    symbol_std = parts[0].replace("/", "").upper()
+    symbol_std = parts[0].replace("/", "").upper()     # /ethusdt -> ETHUSDT
     timeframe = parts[1] if len(parts) > 1 else None
 
     await update.message.reply_text(f"⏳ Analysing {symbol_std} ...")
@@ -619,4 +619,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

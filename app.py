@@ -72,8 +72,8 @@ gemini_scanner = genai.GenerativeModel(GEMINI_MODEL_SCANNER)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # demo=False -> real, set True if you want testnet behaviour
-    bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET, demo=False, timestamp="local")
+    # Correct init for your py-bingx version (no demo/timestamp args)
+    bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
 
 # ============================================================
 # BYBIT MARKET DATA
@@ -708,3 +708,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

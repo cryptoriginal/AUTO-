@@ -57,6 +57,7 @@ SUPPORTED_BINGX = set()
 auto_open_positions = set()
 last_signal_time: dict[tuple[str, str], float] = {}
 
+
 # ============================================================
 # CLIENTS
 # ============================================================
@@ -66,7 +67,7 @@ gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # simple init; no demo flag / timestamp arg so it matches py-bingx 0.4+
+    # simple init; arguments that exist in py-bingx 0.4+
     bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
 
 
@@ -588,10 +589,23 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles commands like /btcusdt or /ethusdt.
+    """
     if not update.message:
         return
+
     text = update.message.text.strip()
-    symbol = text.replace("/", "").upper()
+
+    # Remove leading "/" and any arguments after a space
+    if text.startswith("/"):
+        symbol = text[1:].split()[0].upper()
+    else:
+        symbol = text.replace("/", "").split()[0].upper()
+
+    if not symbol.endswith("USDT"):
+        await update.message.reply_text("Send coin like: `/btcusdt` or `/ethusdt`", parse_mode="Markdown")
+        return
 
     await update.message.reply_text(f"⏳ Analysing {symbol}...")
 
@@ -601,10 +615,6 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = f"❌ Error analysing {symbol}: {e}"
 
     await update.message.reply_markdown(result)
-
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send coin like:  `BTCUSDT` (no slash).")
 
 
 # ============================================================
@@ -629,11 +639,13 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("stop", cmd_stop))
 
-    # coin command, e.g. "BTCUSDT"
-    application.add_handler(MessageHandler(filters.Regex(r"^[A-Za-z]+USDT$"), handle_pair))
-
-    # everything else
-    application.add_handler(MessageHandler(filters.COMMAND, unknown))
+    # Any other command → treated as coin, e.g. /btcusdt
+    application.add_handler(
+        MessageHandler(
+            filters.COMMAND & ~filters.Regex(r"^/(start|stop)$"),
+            handle_pair,
+        )
+    )
 
     print("Bot running...")
     application.run_polling()

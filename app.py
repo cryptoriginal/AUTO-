@@ -2,12 +2,15 @@
 # GEMINI + MEXC FUTURES TG BOT
 # - Autoscan (VWAP + Volume Profile)
 # - Manual Analysis (multi-TF)
+# - Optional BingX USDT-M auto-trade (MARKET, 7x)
 # For Render Background Worker
 # ================================
 
 import os
 import time
 import json
+import hmac
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -42,12 +45,15 @@ if not GEMINI_KEY:
 
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
+# MEXC (for analysis)
 MEXC_URL = "https://contract.mexc.com"
+
+# Autoscan timing
 SCAN_INTERVAL = 300       # 5 minutes
 COOLDOWN = 600            # 10 minutes cooldown after sending signals
 MAX_COINS = 20            # max pairs per scan
 
-# For autoscan jobs per chat
+# Autoscan jobs per chat
 AUTOSCAN = {}
 
 # Timeframe mapping for manual analysis
@@ -68,7 +74,7 @@ TIMEFRAME_MAP = {
     "weekly": ("Week1", "1W"),
 }
 
-# Default multi-TF set for /coin without timeframe
+# Default multi-TF set for /coin without timeframe (Option A)
 MULTI_TF_DEFAULTS = [
     ("Min5", "5m"),
     ("Min15", "15m"),
@@ -77,6 +83,14 @@ MULTI_TF_DEFAULTS = [
     ("Day1", "1D"),
     ("Week1", "1W"),
 ]
+
+# -------------------- BingX AUTO TRADE CONFIG --------------------
+BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
+BINGX_ENABLE_AUTOTRADE = os.getenv("BINGX_ENABLE_AUTOTRADE", "false").lower() == "true"
+BINGX_TRADE_COST_USDT = float(os.getenv("BINGX_TRADE_COST_USDT", "10"))  # margin per trade
+BINGX_BASE_URL = "https://open-api.bingx.com"
+BINGX_LEVERAGE = 7  # fixed 7x as requested
 
 # ============================================================
 # LOGGING
@@ -90,7 +104,7 @@ log = logging.getLogger("bot")
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (MEXC)
 # ============================================================
 
 def symbol_format(cmd: str) -> str:
@@ -188,6 +202,99 @@ def format_candles_for_ai(candles, max_rows: int = 150):
             f"{c['low']:.6f},{c['close']:.6f},{c['volume']:.2f}"
         )
     return "\n".join(lines)
+
+
+# ============================================================
+# HELPER FUNCTIONS (BINGX)
+# ============================================================
+
+def mexc_symbol_to_bingx(mexc_symbol: str) -> str:
+    # BTC_USDT -> BTC-USDT
+    return mexc_symbol.replace("_", "-")
+
+
+def bingx_sign(params: dict) -> str:
+    """
+    Create signed query string for BingX.
+    """
+    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    signature = hmac.new(
+        BINGX_API_SECRET.encode("utf-8"),
+        qs.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{qs}&signature={signature}"
+
+
+def bingx_get_last_price(symbol: str) -> float | None:
+    """
+    Get last price for BingX perp symbol, e.g. BTC-USDT.
+    """
+    try:
+        url = f"{BINGX_BASE_URL}/openApi/swap/v2/quote/price"
+        r = requests.get(url, params={"symbol": symbol}, timeout=10).json()
+        if not r.get("success"):
+            log.warning(f"BingX price error: {r}")
+            return None
+        data = r.get("data") or {}
+        return float(data.get("price"))
+    except Exception as e:
+        log.error(f"bingx_get_last_price error: {e}")
+        return None
+
+
+def bingx_place_market_order(symbol: str, direction: str) -> dict | None:
+    """
+    Place MARKET order on BingX USDT-M Perp.
+    direction: 'long' or 'short'
+    Uses:
+      - fixed 7x leverage
+      - cost (margin) from BINGX_TRADE_COST_USDT
+    """
+    if not (BINGX_API_KEY and BINGX_API_SECRET):
+        log.info("BingX API keys not set, skipping auto-trade.")
+        return None
+
+    side = "BUY" if direction.lower() == "long" else "SELL"
+    position_side = "LONG" if direction.lower() == "long" else "SHORT"
+
+    price = bingx_get_last_price(symbol)
+    if not price or price <= 0:
+        log.warning(f"No price for {symbol}, cannot place order.")
+        return None
+
+    # approximate quantity from cost * leverage / price
+    notional = BINGX_TRADE_COST_USDT * BINGX_LEVERAGE
+    quantity = notional / price
+
+    # basic rounding – exchange may still reject if under min size
+    quantity = float(f"{quantity:.6f}")
+
+    timestamp = int(time.time() * 1000)
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": position_side,
+        "type": "MARKET",
+        "quantity": quantity,
+        "timestamp": timestamp,
+    }
+
+    signed_qs = bingx_sign(params)
+    url = f"{BINGX_BASE_URL}/openApi/swap/v2/trade/order?{signed_qs}"
+    headers = {
+        "X-BX-APIKEY": BINGX_API_KEY,
+        "User-Agent": "tg-gemini-bot",
+    }
+
+    try:
+        r = requests.post(url, headers=headers, timeout=10)
+        data = r.json()
+        log.info(f"BingX order response: {data}")
+        return data
+    except Exception as e:
+        log.error(f"bingx_place_market_order error: {e}")
+        return None
 
 
 # ============================================================
@@ -361,6 +468,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- I only send signals when probability ≥ 85% and RR ≥ 1.9.\n"
         "- Focus: VWAP + fixed-range volume profile + candle confluence.\n"
         "- Cooldown ~10 minutes after sending signals.\n\n"
+        f"Auto-trade on BingX: {'ON ✅' if BINGX_ENABLE_AUTOTRADE else 'OFF ❌'}\n"
         "Manual analysis still works, e.g. `/btcusdt` or `/suiusdt 4h`."
     )
 
@@ -400,8 +508,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- `/btcusdt` → multi-TF (5m→1W) analysis\n"
         "- `/suiusdt 4h` → analysis only on 4h\n"
         "- `/ethusdt 15m` → analysis only on 15m\n\n"
-        "I return probabilities for Upside / Downside / Flat.\n"
-        "If best scenario ≥ 75% I also suggest entry / SL / TP.\n\n"
+        f"Auto-trade: {'ENABLED (BingX MARKET 7x)' if BINGX_ENABLE_AUTOTRADE else 'DISABLED'}\n"
         "Use this as decision support, not guaranteed profit. Futures = high risk."
         ,
         parse_mode="Markdown",
@@ -458,15 +565,27 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         tp_str = ", ".join(f"{float(x):.6f}" for x in tps)
+
+        # ---- optional auto-trade on BingX ----
+        trade_info = ""
+        if BINGX_ENABLE_AUTOTRADE:
+            bingx_symbol = mexc_symbol_to_bingx(coin)
+            result = bingx_place_market_order(bingx_symbol, direction)
+            if result and result.get("success"):
+                trade_info = "\nAuto-trade: ✅ BingX MARKET 7x order placed."
+            else:
+                trade_info = "\nAuto-trade: ❌ Failed to place order (check logs / API keys / min size)."
+
         msg = (
             f"📡 AUTO SIGNAL\n"
             f"{coin}\n"
             f"Scenario: {dom.upper()} (Up {up}% / Down {down}% / Flat {flat}%)\n"
             f"Direction: {direction.upper()}\n"
-            f"Entry: {float(entry):.6f}\n"
-            f"SL: {float(sl):.6f}\n"
+            f"Entry (AI level): {float(entry):.6f}\n"
+            f"SL (AI level): {float(sl):.6f}\n"
             f"TPs: {tp_str}\n"
             f"Min RR: {float(rr):.2f}"
+            f"{trade_info}"
         )
         messages.append(msg)
 
@@ -493,7 +612,6 @@ async def coin_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cmd = parts[0].lower()
     if cmd in ("start", "stop", "help"):
-        # already handled by dedicated CommandHandlers
         return
 
     tf_arg = parts[1].lower() if len(parts) > 1 else None
@@ -519,7 +637,7 @@ async def coin_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         tf_blocks[requested_tf_label] = format_candles_for_ai(candles)
     else:
-        # Multi-TF default (option A)
+        # Multi-TF default (Option A)
         for interval, label in MULTI_TF_DEFAULTS:
             candles = get_mexc_candles(symbol, interval, 200)
             if candles:

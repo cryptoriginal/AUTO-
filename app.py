@@ -1,26 +1,25 @@
 # ============================================================
-# FULL APP.PY — TELEGRAM BOT + GEMINI AI + BYBIT SCANNER
-# Uses polling (no webhooks). Designed for Render Web Service.
-# - Manual analysis: /btcusdt, /ethusdt, etc.
+# TELEGRAM + GEMINI + BYBIT SCANNER + OPTIONAL BINGX AUTOTRADE
+# - Manual analysis:  /btcusdt , /ethusdt , etc.
 # - Auto-scan: scans top Bybit USDT futures every N minutes.
-# - Optional BingX autotrade (if API keys provided).
+# - Uses python-telegram-bot v13 (Updater + JobQueue, no webhooks).
 # ============================================================
 
 import os
 import json
 import re
 import time
-import asyncio
 
 import requests
 import google.generativeai as genai
+
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Updater,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
-    filters,
+    Filters,
+    CallbackContext,
 )
 
 from bingx.api import BingxAPI
@@ -41,9 +40,7 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY")
 
-# Use a stable, supported model name.
-# IMPORTANT: leave this as gemini-1.5-pro unless you know
-# your library + API support something else.
+# Use a stable model name for google-generativeai.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
 
 # Scanner / trade settings
@@ -70,7 +67,6 @@ gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # Try a simple constructor. If it fails, disable autotrade but keep bot running.
     try:
         bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
     except Exception as e:
@@ -91,9 +87,7 @@ INTERVAL_MAP = {
 
 
 def get_bybit_symbols():
-    """
-    Returns list of top USDT linear futures symbols by 24h turnover.
-    """
+    """Returns list of top USDT linear futures symbols by 24h turnover."""
     try:
         r = requests.get(
             f"{BYBIT_ENDPOINT}/v5/market/tickers",
@@ -116,9 +110,7 @@ def get_bybit_symbols():
 
 
 def get_candles(symbol: str, tf: str):
-    """
-    Returns OHLCV candles for Bybit linear futures.
-    """
+    """Returns OHLCV candles for Bybit linear futures."""
     interval = INTERVAL_MAP.get(tf)
     if not interval:
         return []
@@ -156,9 +148,7 @@ def get_candles(symbol: str, tf: str):
 
 
 def get_price(symbol: str):
-    """
-    Latest price from Bybit ticker.
-    """
+    """Latest price from Bybit ticker."""
     try:
         r = requests.get(
             f"{BYBIT_ENDPOINT}/v5/market/tickers",
@@ -180,10 +170,7 @@ def get_price(symbol: str):
 # ============================================================
 
 def load_supported_bingx_symbols():
-    """
-    Fill SUPPORTED_BINGX with symbols like 'BTCUSDT' that exist on BingX.
-    If any error happens, we just disable autotrade.
-    """
+    """Fill SUPPORTED_BINGX with symbols like 'BTCUSDT' that exist on BingX."""
     global SUPPORTED_BINGX
 
     if not bingx:
@@ -225,9 +212,7 @@ def load_supported_bingx_symbols():
 
 
 def get_bingx_usdt_balance():
-    """
-    Return available margin in USDT from BingX perpetual account.
-    """
+    """Return available margin in USDT from BingX perpetual account."""
     if not bingx:
         return None
     try:
@@ -249,29 +234,28 @@ def get_bingx_usdt_balance():
 def force_json(text: str):
     """
     Extract first valid JSON object from text.
-    Very defensive: tries direct parse, bracket slicing, regex.
-    If everything fails, returns {} instead of raising.
+    Very defensive: direct parse, bracket slice, regex.
     """
     if not text:
         return {}
 
-    # try direct JSON first
+    # Try direct JSON
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # strip markdown fences like ```json ... ```
+    # Strip markdown fences
     cleaned = re.sub(r"```(?:json)?", "", text)
     cleaned = cleaned.replace("```", "")
 
-    # try again on cleaned
+    # Try cleaned
     try:
         return json.loads(cleaned)
     except Exception:
         pass
 
-    # bracket slice
+    # Bracket slice
     try:
         start = cleaned.index("{")
         end = cleaned.rindex("}")
@@ -279,7 +263,7 @@ def force_json(text: str):
     except Exception:
         pass
 
-    # regex fallback
+    # Regex
     try:
         m = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if m:
@@ -291,11 +275,7 @@ def force_json(text: str):
 
 
 def ask_gemini_json(prompt: str):
-    """
-    Call Gemini and return parsed JSON (or {}).
-    If the model name is invalid (404) or any error occurs,
-    we log and return {} so caller can fall back.
-    """
+    """Call Gemini and return parsed JSON (or {})."""
     try:
         resp = gemini_model.generate_content(prompt)
         txt = (resp.text or "").strip()
@@ -306,10 +286,7 @@ def ask_gemini_json(prompt: str):
 
 
 def ask_gemini_text(prompt: str) -> str:
-    """
-    Call Gemini and return plain text summary (no JSON).
-    Used as fallback when JSON is unusable.
-    """
+    """Call Gemini and return plain text (no JSON)."""
     try:
         resp = gemini_model.generate_content(prompt)
         return (resp.text or "").strip()
@@ -331,10 +308,10 @@ Analyse:
 - Current price: {price}
 - Candles JSON: {json.dumps(candles)}
 
-Focus on trend, key levels, VWAP behaviour, volume profile and reversal candles.
+Focus on trend, key levels, VWAP, volume profile and reversal candles.
 Decide ONLY if there is a very clean setup.
 
-Return ONLY valid JSON in this exact schema:
+Return ONLY valid JSON:
 
 {{
  "symbol": "{symbol}",
@@ -360,8 +337,7 @@ Snapshot: {json.dumps(snapshot)}
 1. Evaluate upside, downside and flat probabilities (0-100 each).
 2. Choose "direction": "long", "short" or "flat".
 3. If direction is long/short AND its probability >= 80,
-   propose entry, stop, tp1, tp2 based on key levels
-   (recent swing high/low, reversal candle, strong support/resistance).
+   propose entry, stop, tp1, tp2 based on key levels.
 4. If no good trade, set entry/stop/tp1/tp2 to null.
 
 Return ONLY JSON:
@@ -385,7 +361,7 @@ Return ONLY JSON:
 # MANUAL ANALYSIS ( /btcusdt etc. )
 # ============================================================
 
-async def analyze_manual(symbol: str) -> str:
+def analyze_manual(symbol: str) -> str:
     symbol = symbol.upper()
     price = get_price(symbol)
     if price is None:
@@ -398,20 +374,19 @@ async def analyze_manual(symbol: str) -> str:
     }
 
     prompt = build_manual_prompt(symbol, snapshot, price)
-    data = await asyncio.to_thread(ask_gemini_json, prompt)
+    data = ask_gemini_json(prompt)
 
-    # If Gemini didn't give usable JSON, fall back to plain text explanation
     if not data:
+        # Fallback plain-text explanation
         fallback_prompt = f"""
 You are a top crypto trader.
 
 Give a short 3–5 line trading view for {symbol} at price {price}.
-Use the idea of trend, key support/resistance, and whether it is better
-to look for longs, shorts or stay flat. Do NOT return JSON, just text.
+Talk about trend, key support/resistance, and whether longs/shorts/flat
+are better. Do NOT return JSON, just text.
 """
-        text = await asyncio.to_thread(ask_gemini_text, fallback_prompt)
+        text = ask_gemini_text(fallback_prompt)
         if not text:
-            # Last resort: at least tell user there was an AI issue
             return (
                 f"❌ Gemini could not analyse {symbol} right now.\n"
                 f"Model: {GEMINI_MODEL}\n"
@@ -457,7 +432,7 @@ to look for longs, shorts or stay flat. Do NOT return JSON, just text.
 
 
 # ============================================================
-# AUTOTRADE (simple always-execute version)
+# AUTOTRADE
 # ============================================================
 
 def maybe_autotrade(signal, bot):
@@ -525,7 +500,7 @@ def maybe_autotrade(signal, bot):
 # AUTOSCAN LOGIC
 # ============================================================
 
-async def analyze_signal(symbol: str):
+def analyze_signal(symbol: str):
     price = get_price(symbol)
     if price is None:
         return None
@@ -537,7 +512,7 @@ async def analyze_signal(symbol: str):
     }
 
     prompt = build_scan_prompt(symbol, candles, price)
-    data = await asyncio.to_thread(ask_gemini_json, prompt)
+    data = ask_gemini_json(prompt)
     if not data:
         return None
 
@@ -567,11 +542,14 @@ async def analyze_signal(symbol: str):
     }
 
 
-async def scan_once(app):
+def scan_job(context: CallbackContext):
+    """JobQueue callback: runs periodically in background."""
+    global last_signal_time
+
     if not SCAN_ENABLED or not OWNER_CHAT_ID:
         return
 
-    symbols = await asyncio.to_thread(get_bybit_symbols)
+    symbols = get_bybit_symbols()
     if not symbols:
         return
 
@@ -579,7 +557,7 @@ async def scan_once(app):
 
     for sym in symbols:
         try:
-            sig = await analyze_signal(sym)
+            sig = analyze_signal(sym)
         except Exception as e:
             print("scan error for", sym, ":", e)
             continue
@@ -611,52 +589,36 @@ async def scan_once(app):
             f"Reason: _{sig['summary']}_"
         )
 
-        await app.bot.send_message(OWNER_CHAT_ID, msg, parse_mode="Markdown")
+        context.bot.send_message(OWNER_CHAT_ID, msg, parse_mode="Markdown")
 
         # auto-trade
-        maybe_autotrade(sig, app.bot)
-
-
-async def scanner_loop(app):
-    """
-    Background loop started from post_init.
-    No JobQueue used.
-    """
-    await asyncio.sleep(5)
-    while True:
-        try:
-            await scan_once(app)
-        except Exception as e:
-            print("scanner_loop error:", e)
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        maybe_autotrade(sig, context.bot)
 
 
 # ============================================================
 # TELEGRAM HANDLERS
 # ============================================================
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_start(update: Update, context: CallbackContext):
     global SCAN_ENABLED
     SCAN_ENABLED = True
-    await update.message.reply_text(
+    update.message.reply_text(
         "✅ Auto-scanner ON.\n"
         f"Scans top Bybit USDT futures every {SCAN_INTERVAL_SECONDS // 60} minutes.\n"
         f"Signals only if probability ≥ {MIN_PROB_SCAN}% and RR ≥ {MIN_RR}."
     )
 
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_stop(update: Update, context: CallbackContext):
     global SCAN_ENABLED
     SCAN_ENABLED = False
-    await update.message.reply_text(
+    update.message.reply_text(
         "⏹ Auto-scanner OFF. Manual analysis still works."
     )
 
 
-async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles commands like /btcusdt or /ethusdt.
-    """
+def handle_pair(update: Update, context: CallbackContext):
+    """Handles commands like /btcusdt or /ethusdt."""
     if not update.message:
         return
 
@@ -669,54 +631,51 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = text.replace("/", "").split()[0].upper()
 
     if not symbol.endswith("USDT"):
-        await update.message.reply_text(
+        update.message.reply_text(
             "Send coin like: `/btcusdt` or `/ethusdt`", parse_mode="Markdown"
         )
         return
 
-    await update.message.reply_text(f"⏳ Analysing {symbol}...")
+    update.message.reply_text(f"⏳ Analysing {symbol}...")
 
     try:
-        result = await analyze_manual(symbol)
+        result = analyze_manual(symbol)
     except Exception as e:
         print("handle_pair error:", e)
         result = f"❌ Error analysing {symbol}: {e}"
 
-    await update.message.reply_markdown(result)
+    update.message.reply_markdown(result)
 
 
 # ============================================================
-# POST_INIT + MAIN
+# MAIN
 # ============================================================
-
-async def post_init(app):
-    # load BingX symbols once (in background thread)
-    await asyncio.to_thread(load_supported_bingx_symbols)
-    # start scanner loop
-    app.create_task(scanner_loop(app))
-
 
 def main():
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    # Updater style (v13) – stable and simple
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("stop", cmd_stop))
+    # Load BingX symbols once at startup
+    load_supported_bingx_symbols()
 
-    # Any other command → treated as coin, e.g. /btcusdt
-    application.add_handler(
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("stop", cmd_stop))
+    dp.add_handler(
         MessageHandler(
-            filters.COMMAND & ~filters.Regex(r"^/(start|stop)$"),
+            Filters.command & ~Filters.regex(r"^/(start|stop)$"),
             handle_pair,
         )
     )
 
-    print("Bot running...")
-    application.run_polling()
+    # Background scanner via JobQueue
+    job_queue = updater.job_queue
+    job_queue.run_repeating(scan_job, interval=SCAN_INTERVAL_SECONDS, first=10)
+
+    print("Bot running with polling (v13 Updater)...")
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == "__main__":

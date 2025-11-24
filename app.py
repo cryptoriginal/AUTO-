@@ -1,21 +1,12 @@
-# ============================================================
-# TELEGRAM BOT + GEMINI AI + BYBIT SCANNER (NO AUTOTRADE)
-# ------------------------------------------------------------
-# - Deploy as a Web Service on Render
-# - Uses polling (no webhooks)
-# - Manual analysis: /btcusdt, /ethusdt, etc.
-# - Auto-scan: scans top Bybit USDT futures every N minutes
-#   and sends best signals to OWNER_CHAT_ID
-# ============================================================
-
+# app.py
 import os
-import json
-import re
 import time
-import asyncio
+import json
+import logging
+from datetime import datetime, timezone
 
 import requests
-import google.generativeai as genai
+from google import genai
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -26,539 +17,669 @@ from telegram.ext import (
 )
 
 # ============================================================
-# ENVIRONMENT
+# CONFIG / ENV
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or "0")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-if not GEMINI_API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN env var is required")
 
-# Use a stable, supported model name.
-# Keep this as gemini-1.5-pro unless you are 100% sure.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+# Gemini client uses GEMINI_API_KEY env by default
+gemini_client = genai.Client()
 
-# Scanner / analysis settings
-SCAN_INTERVAL_SECONDS = 300          # background scan interval (5 min)
-SIGNAL_COOLDOWN_SECONDS = 600        # 10 min cooldown per (symbol, direction)
-MIN_VOLUME = 50_000_000              # Bybit 24h turnover filter
-MIN_PROB_SCAN = 80                   # autoscan probability threshold
-MIN_RR = 1.9                         # minimum RR
+MEXC_FUTURES_BASE = "https://contract.mexc.com"
+SCAN_INTERVAL_SEC = 5 * 60      # every 5 minutes
+COOLDOWN_SEC = 10 * 60          # 10-minute cooldown after sending signals
+MAX_SCAN_PAIRS = 15             # limit number of pairs per scan to control cost/time
 
-SCAN_ENABLED = True
-last_signal_time: dict[tuple[str, str], float] = {}  # (symbol, direction) -> last timestamp
-
-# ============================================================
-# CLIENTS
-# ============================================================
-
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-
-# ============================================================
-# BYBIT MARKET DATA
-# ============================================================
-
-BYBIT_ENDPOINT = "https://api.bybit.com"
-
-INTERVAL_MAP = {
-    "15m": "15",
-    "1h": "60",
-    "4h": "240",
+# Map user timeframe strings to MEXC interval and label
+TIMEFRAME_MAP = {
+    "5m": ("Min5", "5m"),
+    "15m": ("Min15", "15m"),
+    "1h": ("Min60", "1h"),
+    "2h": ("Min60", "2h (approx, using 1h data)"),
+    "4h": ("Hour4", "4h"),
+    "6h": ("Hour4", "6h (approx, using 4h data)"),
+    "12h": ("Hour8", "12h (approx, using 8h data)"),
+    "1d": ("Day1", "1D"),
+    "d": ("Day1", "1D"),
+    "daily": ("Day1", "1D"),
+    "1w": ("Week1", "1W"),
+    "w": ("Week1", "1W"),
+    "weekly": ("Week1", "1W"),
 }
 
+# Default multi-timeframe set for manual analysis
+MULTI_TF_DEFAULTS = [
+    ("Min5", "5m"),
+    ("Min15", "15m"),
+    ("Min60", "1h"),
+    ("Hour4", "4h"),
+    ("Day1", "1D"),
+    ("Week1", "1W"),
+]
 
-def get_bybit_symbols():
-    """
-    Returns list of top USDT linear futures symbols by 24h turnover.
-    """
-    try:
-        r = requests.get(
-            f"{BYBIT_ENDPOINT}/v5/market/tickers",
-            params={"category": "linear"},
-            timeout=10,
-        )
-        data = r.json()
-        items = data.get("result", {}).get("list", []) or []
-        filtered = [
-            it
-            for it in items
-            if it.get("symbol", "").endswith("USDT")
-            and float(it.get("turnover24h") or 0) >= MIN_VOLUME
-        ]
-        filtered.sort(key=lambda x: float(x.get("turnover24h") or 0), reverse=True)
-        return [it["symbol"] for it in filtered[:30]]
-    except Exception as e:
-        print("get_bybit_symbols error:", e)
-        return []
+# In-memory storage of autoscan jobs per chat
+AUTOSCAN_JOBS = {}
 
-
-def get_candles(symbol: str, tf: str):
-    """
-    Returns OHLCV candles for Bybit linear futures.
-    """
-    interval = INTERVAL_MAP.get(tf)
-    if not interval:
-        return []
-
-    try:
-        r = requests.get(
-            f"{BYBIT_ENDPOINT}/v5/market/kline",
-            params={
-                "category": "linear",
-                "symbol": symbol,
-                "interval": interval,
-                "limit": 200,
-            },
-            timeout=10,
-        )
-        data = r.json()
-        if data.get("retCode") != 0:
-            return []
-        out = []
-        for c in data.get("result", {}).get("list", []) or []:
-            out.append(
-                {
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4]),
-                    "volume": float(c[5]),
-                }
-            )
-        # oldest -> newest
-        return list(reversed(out))
-    except Exception as e:
-        print("get_candles error:", e)
-        return []
-
-
-def get_price(symbol: str):
-    """
-    Latest price from Bybit ticker.
-    """
-    try:
-        r = requests.get(
-            f"{BYBIT_ENDPOINT}/v5/market/tickers",
-            params={"category": "linear", "symbol": symbol},
-            timeout=10,
-        )
-        data = r.json()
-        items = data.get("result", {}).get("list", []) or []
-        if not items:
-            return None
-        return float(items[0].get("lastPrice"))
-    except Exception as e:
-        print("get_price error:", e)
-        return None
-
+# Logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================
-# GEMINI HELPERS — BULLETPROOF JSON + TEXT FALLBACK
+# MEXC HELPERS
 # ============================================================
 
-def force_json(text: str):
+def fetch_mexc_klines(symbol: str, interval: str, limit: int = 150):
     """
-    Extract first valid JSON object from text.
-    Very defensive: tries direct parse, cleaned parse, slicing, regex.
-    If everything fails, returns {} instead of raising.
+    Fetch OHLCV candles from MEXC futures for given symbol/interval.
+    Uses start/end timestamps to limit to ~`limit` candles.
+    Returns list of dicts: {"time", "open", "high", "low", "close", "volume"}
     """
-    if not text:
-        return {}
-
-    # try direct JSON first
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # strip markdown fences like ```json ... ```
-    cleaned = re.sub(r"```(?:json)?", "", text)
-    cleaned = cleaned.replace("```", "")
-
-    # try again on cleaned
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        pass
-
-    # bracket slice
-    try:
-        start = cleaned.index("{")
-        end = cleaned.rindex("}")
-        return json.loads(cleaned[start:end + 1])
-    except Exception:
-        pass
-
-    # regex fallback
-    try:
-        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if m:
-            return json.loads(m.group())
-    except Exception:
-        pass
-
-    return {}
-
-
-def ask_gemini_json(prompt: str):
-    """
-    Call Gemini and return parsed JSON (or {}).
-    If the model name is invalid (404) or any error occurs,
-    we log and return {} so caller can fall back.
-    """
-    try:
-        resp = gemini_model.generate_content(prompt)
-        txt = (resp.text or "").strip()
-        return force_json(txt)
-    except Exception as e:
-        print("Gemini JSON error:", e)
-        return {}
-
-
-def ask_gemini_text(prompt: str) -> str:
-    """
-    Call Gemini and return plain text summary (no JSON).
-    Used as fallback when JSON is unusable.
-    """
-    try:
-        resp = gemini_model.generate_content(prompt)
-        return (resp.text or "").strip()
-    except Exception as e:
-        print("Gemini text error:", e)
-        return ""
-
-
-# ============================================================
-# PROMPTS
-# ============================================================
-
-def build_scan_prompt(symbol, candles, price):
-    return f"""
-You are an expert crypto futures analyst.
-
-Analyse:
-- Symbol: {symbol}
-- Current price: {price}
-- Candles JSON: {json.dumps(candles)}
-
-Focus on trend, key levels, VWAP behaviour, volume profile and reversal candles.
-Decide ONLY if there is a very clean setup.
-
-Return ONLY valid JSON in this exact schema:
-
-{{
- "symbol": "{symbol}",
- "direction": "long" | "short" | "flat",
- "probability": 0,
- "rr": 0.0,
- "entry": 0.0,
- "stop": 0.0,
- "tp1": 0.0,
- "summary": "very short reason"
-}}
-"""
-
-
-def build_manual_prompt(symbol, snapshot, price):
-    return f"""
-You are a world-class crypto trader.
-
-Symbol: {symbol}
-Current price: {price}
-Snapshot: {json.dumps(snapshot)}
-
-1. Evaluate upside, downside and flat probabilities (0-100 each).
-2. Choose "direction": "long", "short" or "flat".
-3. If direction is long/short AND its probability >= 80,
-   propose entry, stop, tp1, tp2 based on key levels
-   (recent swing high/low, reversal candle, strong support/resistance).
-4. If no good trade, set entry/stop/tp1/tp2 to null.
-
-Return ONLY JSON:
-
-{{
- "symbol": "{symbol}",
- "direction": "long" | "short" | "flat",
- "summary": "short reason",
- "upside": 0,
- "downside": 0,
- "flat": 0,
- "entry": null | 0.0,
- "stop": null | 0.0,
- "tp1": null | 0.0,
- "tp2": null | 0.0
-}}
-"""
-
-
-# ============================================================
-# MANUAL ANALYSIS ( /btcusdt etc. )
-# ============================================================
-
-async def analyze_manual(symbol: str) -> str:
-    symbol = symbol.upper()
-    price = get_price(symbol)
-    if price is None:
-        return f"❌ Could not fetch price for {symbol}."
-
-    snapshot = {
-        "15m": get_candles(symbol, "15m"),
-        "1h": get_candles(symbol, "1h"),
-        "4h": get_candles(symbol, "4h"),
+    # Approx seconds per bar for supported intervals
+    seconds_per_bar = {
+        "Min1": 60,
+        "Min5": 5 * 60,
+        "Min15": 15 * 60,
+        "Min30": 30 * 60,
+        "Min60": 60 * 60,
+        "Hour4": 4 * 60 * 60,
+        "Hour8": 8 * 60 * 60,
+        "Day1": 24 * 60 * 60,
+        "Week1": 7 * 24 * 60 * 60,
+        "Month1": 30 * 24 * 60 * 60,
+    }
+    now = int(time.time())
+    span = seconds_per_bar.get(interval, 60 * 60) * limit
+    start_ts = now - span
+    params = {
+        "interval": interval,
+        "start": start_ts,
+        "end": now,
     }
 
-    prompt = build_manual_prompt(symbol, snapshot, price)
-    data = await asyncio.to_thread(ask_gemini_json, prompt)
+    url = f"{MEXC_FUTURES_BASE}/api/v1/contract/kline/{symbol}"
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get("success"):
+            logger.warning(f"MEXC kline error for {symbol}: {data}")
+            return []
 
-    # If Gemini didn't give usable JSON, fall back to plain text explanation
-    if not data:
-        fallback_prompt = f"""
-You are a top crypto trader.
+        d = data.get("data", {})
+        times = d.get("time") or []
+        opens = d.get("open") or []
+        highs = d.get("high") or []
+        lows = d.get("low") or []
+        closes = d.get("close") or []
+        vols = d.get("vol") or []
 
-Give a short 3–5 line trading view for {symbol} at price {price}.
-Use the idea of trend, key support/resistance, and whether it is better
-to look for longs, shorts or stay flat. Do NOT return JSON, just text.
-"""
-        text = await asyncio.to_thread(ask_gemini_text, fallback_prompt)
-        if not text:
-            # Last resort: at least tell user there was an AI issue
-            return (
-                f"❌ Gemini could not analyse {symbol} right now.\n"
-                f"Model: {GEMINI_MODEL}\n"
-                f"Please try again later."
+        candles = []
+        for i in range(min(len(times), len(opens), len(highs), len(lows), len(closes), len(vols))):
+            candles.append(
+                {
+                    "time": int(times[i]),
+                    "open": float(opens[i]),
+                    "high": float(highs[i]),
+                    "low": float(lows[i]),
+                    "close": float(closes[i]),
+                    "volume": float(vols[i]),
+                }
             )
+        return candles
+    except Exception as e:
+        logger.exception(f"Error fetching MEXC kline for {symbol}: {e}")
+        return []
 
-        return (
-            f"📊 *{symbol} Analysis (fallback)*\n"
-            f"Price: `{price}`\n\n"
-            f"{text}"
+
+def fetch_high_volume_symbols(min_turnover_usdt: float = 50_000_000.0, max_pairs: int = MAX_SCAN_PAIRS):
+    """
+    Fetch futures tickers from MEXC and filter for:
+      - USDT-margined contracts (symbol ends with _USDT)
+      - 24h turnover (amount24) >= min_turnover_usdt
+    Returns list of symbol strings like "BTC_USDT".
+    """
+    url = f"{MEXC_FUTURES_BASE}/api/v1/contract/ticker"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data.get("data")
+
+        # API may return object or list; normalize to list
+        if isinstance(raw, dict):
+            items = [raw]
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            items = []
+
+        filtered = []
+        for item in items:
+            symbol = item.get("symbol")
+            amount24 = float(item.get("amount24", 0.0))
+            if not symbol or not symbol.endswith("_USDT"):
+                continue
+            if amount24 >= min_turnover_usdt:
+                filtered.append((symbol, amount24))
+
+        # Sort by turnover desc and keep top N
+        filtered.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [s for s, _ in filtered[:max_pairs]]
+        return top_symbols
+    except Exception as e:
+        logger.exception(f"Error fetching MEXC tickers: {e}")
+        return []
+
+
+def symbol_from_command(cmd: str) -> str:
+    """
+    Convert Telegram command like 'suiusdt' into MEXC symbol 'SUI_USDT'.
+    """
+    cmd = cmd.strip().lstrip("/").upper()
+    if cmd.endswith("USDT"):
+        base = cmd[:-4]
+        return f"{base}_USDT"
+    # fallback: assume already "SUI_USDT" style
+    if "_" in cmd:
+        return cmd
+    return f"{cmd}_USDT"
+
+
+# ============================================================
+# GEMINI PROMPTS / HELPERS
+# ============================================================
+
+def format_ohlcv_for_prompt(candles, max_rows=150):
+    """
+    Format OHLCV into a compact CSV-style block for LLM.
+    Oldest to newest.
+    """
+    candles = candles[-max_rows:]
+    lines = ["time,open,high,low,close,volume"]
+    for c in candles:
+        ts = int(c["time"])
+        # convert key to readable UTC time (optional)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"{dt},{c['open']:.6f},{c['high']:.6f},{c['low']:.6f},{c['close']:.6f},{c['volume']:.2f}"
         )
-
-    direction = data.get("direction", "flat")
-    summary = data.get("summary", "-")
-    up = int(data.get("upside", 0))
-    down = int(data.get("downside", 0))
-    flat = int(data.get("flat", 0))
-
-    lines = [
-        f"📊 *{symbol} Analysis*",
-        f"Price: `{price}`",
-        f"Direction: *{direction}*",
-        f"Upside: `{up}%`  Downside: `{down}%`  Flat: `{flat}%`",
-        f"Reason: _{summary}_",
-    ]
-
-    entry = data.get("entry")
-    stop = data.get("stop")
-    tp1 = data.get("tp1")
-    tp2 = data.get("tp2")
-
-    if entry and stop and tp1:
-        lines += [
-            "",
-            f"Entry: `{entry}`",
-            f"SL: `{stop}`",
-            f"TP1: `{tp1}`",
-        ]
-        if tp2:
-            lines.append(f"TP2: `{tp2}`")
-
     return "\n".join(lines)
 
 
-# ============================================================
-# AUTOSCAN LOGIC (NO AUTOTRADE)
-# ============================================================
+def build_manual_analysis_prompt(symbol: str, tf_blocks: dict, requested_tf_label: str | None):
+    """
+    Build the prompt for manual /coin analysis.
+    tf_blocks: { "5m": "csv string", "15m": "csv string", ... }
+    """
+    scope_text = (
+        f"Focus ONLY on timeframe: {requested_tf_label}.\n"
+        "Treat it as the main decision frame. Ignore other timeframes."
+        if requested_tf_label
+        else "Use MULTI-TIMEFRAME analysis: weekly & daily for bias, 4h/1h for structure, 15m/5m for timing."
+    )
 
-async def analyze_signal(symbol: str):
-    price = get_price(symbol)
-    if price is None:
-        return None
+    tf_texts = []
+    for label, csv_block in tf_blocks.items():
+        tf_texts.append(f"=== TIMEFRAME {label} ===\n{csv_block}")
 
-    candles = {
-        "15m": get_candles(symbol, "15m"),
-        "1h": get_candles(symbol, "1h"),
-        "4h": get_candles(symbol, "4h"),
-    }
+    prompt = f"""
+You are a world-class crypto futures trader and risk manager (top 1% on earth).
 
-    prompt = build_scan_prompt(symbol, candles, price)
-    data = await asyncio.to_thread(ask_gemini_json, prompt)
-    if not data:
-        return None
+Exchange: MEXC Futures
+Contract: {symbol}
 
-    if data.get("direction") == "flat":
-        return None
-    if int(data.get("probability", 0)) < MIN_PROB_SCAN:
-        return None
-    if float(data.get("rr", 0.0)) < MIN_RR:
-        return None
+Task:
+- Analyze the provided OHLCV data.
+- Estimate the probability (in %) of three scenarios in the NEXT phase of the market:
+  1) Upside move (sustained bullish move)
+  2) Downside move (sustained bearish move)
+  3) Flat / choppy / range-bound conditions where trade should be avoided
 
+{scope_text}
+
+When reasoning:
+- Consider trend, market structure (HH/HL, LH/LL), key support/resistance, liquidity zones.
+- Consider candlestick patterns (hammer, doji, engulfing, pin bars), wicks, rejection candles.
+- Consider classic chart patterns (flags, wedges, ranges).
+- Approximate leading indicators (RSI, MACD, moving averages) mentally from the OHLCV.
+- Use conservative risk management: only suggest trades when edge is clear.
+
+Trade rules:
+- Let "highest_prob" be the scenario with the highest probability.
+- If highest_prob < 75, DO NOT provide a trade plan (trade_plan = null).
+- If highest_prob >= 75:
+    - If dominant scenario is upside: suggest a LONG.
+    - If dominant scenario is downside: suggest a SHORT.
+    - Entry should be near a logical level (e.g. retest of broken structure, key S/R, VWAP-like levels).
+    - Stop loss must be beyond a meaningful swing high/low to reduce stop-hunt risk.
+    - Provide 1-2 take profit targets with minimum risk:reward of 1:1.9 or better.
+
+Output format:
+Return STRICTLY valid JSON, no extra text, no markdown, no commentary.
+
+JSON SCHEMA:
+{{
+  "upside_prob": int,   // 0-100
+  "downside_prob": int, // 0-100
+  "flat_prob": int,     // 0-100
+  "dominant_scenario": "upside" | "downside" | "flat",
+  "trade_plan": null | {{
+     "direction": "long" | "short",
+     "entry": float,
+     "stop_loss": float,
+     "take_profits": [float, ...],
+     "min_rr": float
+  }},
+  "summary": "very short explanation, max 3 sentences"
+}}
+
+Make sure upside_prob + downside_prob + flat_prob is close to 100.
+Return ONLY this JSON object.
+"""
+    full_contents = [prompt, "\n\n".join(tf_texts)]
+    return full_contents
+
+
+def build_autoscan_prompt(symbol: str, tf_label: str, csv_block: str):
+    """
+    Build prompt for auto-scan signals.
+    Focus: VWAP + fixed range volume profile between last swing high/low + candles.
+    Threshold for trade_plan: 85%.
+    """
+    prompt = f"""
+You are a crypto futures scalping expert, focused on VWAP and fixed-range volume profile.
+
+Exchange: MEXC Futures
+Contract: {symbol}
+Timeframe: {tf_label}
+
+Data:
+- OHLCV data is provided in CSV form: time,open,high,low,close,volume.
+- Use it to approximate:
+    - Session VWAP and intraday VWAP behaviour.
+    - Fixed-range volume profile between most recent major swing high and swing low (approximate using per-candle volume and price).
+    - Identification of high-volume nodes / low-volume areas.
+- Combine this with candlestick patterns and basic structure to make decisions.
+
+Task:
+- Estimate the probability (in %) of:
+  1) Upside move (trend move up)
+  2) Downside move (trend move down)
+  3) Flat / choppy / noisy zone
+
+- Pay SPECIAL attention to:
+  - Price interaction with VWAP (bounces, rejections, reclaim/reject patterns).
+  - Price interacting with high-volume nodes or low-volume areas within the recent swing range.
+  - Candlestick confirmation at those levels (rejection wicks, engulfing, hammers, etc).
+
+Trade rules:
+- Let "highest_prob" be the scenario with the highest probability.
+- If highest_prob < 85, set trade_plan = null (NO trade).
+- If highest_prob >= 85:
+    - If dominant scenario is upside: LONG.
+    - If dominant scenario is downside: SHORT.
+    - Choose entry at a logical level that aligns with VWAP + volume profile + structure.
+    - Stop loss must be beyond a meaningful swing high/low.
+    - Provide 1-2 take profit levels with minimum risk:reward of 1:1.9 or better.
+
+Output format:
+Return STRICTLY valid JSON, no extra text.
+
+JSON SCHEMA:
+{{
+  "upside_prob": int,
+  "downside_prob": int,
+  "flat_prob": int,
+  "dominant_scenario": "upside" | "downside" | "flat",
+  "trade_plan": null | {{
+     "direction": "long" | "short",
+     "entry": float,
+     "stop_loss": float,
+     "take_profits": [float, ...],
+     "min_rr": float
+  }}
+}}
+
+Return ONLY this JSON object.
+"""
+
+    return [prompt, f"=== TIMEFRAME {tf_label} ===\n{csv_block}"]
+
+
+def call_gemini_for_json(contents):
+    """
+    Call Gemini 2.5 Flash and parse JSON from response.text.
+    Returns dict or None.
+    """
     try:
-        entry = float(data["entry"])
-        stop = float(data["stop"])
-        tp1 = float(data["tp1"])
-    except Exception:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": data["direction"],
-        "probability": int(data["probability"]),
-        "entry": entry,
-        "stop": stop,
-        "tp1": tp1,
-        "rr": float(data["rr"]),
-        "summary": data.get("summary", ""),
-    }
-
-
-async def scan_once(app):
-    if not SCAN_ENABLED or not OWNER_CHAT_ID:
-        return
-
-    symbols = await asyncio.to_thread(get_bybit_symbols)
-    if not symbols:
-        return
-
-    now = time.time()
-
-    for sym in symbols:
-        try:
-            sig = await analyze_signal(sym)
-        except Exception as e:
-            print("scan error for", sym, ":", e)
-            continue
-
-        if not sig:
-            continue
-
-        key = (sym, sig["direction"])
-        last = last_signal_time.get(key)
-        if last and now - last < SIGNAL_COOLDOWN_SECONDS:
-            continue
-
-        last_signal_time[key] = now
-
-        msg = (
-            f"🚨 *AI SIGNAL*\n"
-            f"Symbol: `{sym}`\n"
-            f"Direction: `{sig['direction']}`\n"
-            f"Probability: `{sig['probability']}%`\n"
-            f"RR: `{sig['rr']}`\n"
-            f"Entry: `{sig['entry']}`\n"
-            f"SL: `{sig['stop']}`\n"
-            f"TP1: `{sig['tp1']}`\n"
-            f"Reason: _{sig['summary']}_"
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
         )
-
-        await app.bot.send_message(OWNER_CHAT_ID, msg, parse_mode="Markdown")
-
-
-async def scanner_loop(app):
-    """
-    Background loop started from post_init.
-    No JobQueue used.
-    """
-    await asyncio.sleep(5)
-    while True:
-        try:
-            await scan_once(app)
-        except Exception as e:
-            print("scanner_loop error:", e)
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        raw = response.text
+        # Sometimes models wrap JSON in ```json ```; strip if needed.
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            # Might be like json\n{...}
+            if "\n" in raw:
+                raw = raw.split("\n", 1)[1]
+        data = json.loads(raw)
+        return data
+    except Exception as e:
+        logger.exception(f"Error calling Gemini or parsing JSON: {e}")
+        return None
 
 
 # ============================================================
 # TELEGRAM HANDLERS
 # ============================================================
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global SCAN_ENABLED
-    SCAN_ENABLED = True
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /start:
+      - Send welcome message
+      - Start autoscan job for this chat (if not already)
+    """
+    chat_id = update.effective_chat.id
+
+    if chat_id in AUTOSCAN_JOBS:
+        await update.message.reply_text(
+            "✅ Bot is already running auto-scan.\n\n"
+            "Use /stop to stop auto-signals.\n"
+            "You can still request manual analysis: e.g. /btcusdt 1h"
+        )
+        return
+
+    job = context.job_queue.run_repeating(
+        autoscan_job,
+        interval=SCAN_INTERVAL_SEC,
+        first=5,  # start after 5 seconds
+        data={"chat_id": chat_id, "last_signal_time": 0.0},
+        name=f"autoscan_{chat_id}",
+    )
+    AUTOSCAN_JOBS[chat_id] = job
+
     await update.message.reply_text(
-        "✅ Auto-scanner ON.\n"
-        f"Scans top Bybit USDT futures every {SCAN_INTERVAL_SECONDS // 60} minutes.\n"
-        f"Signals only if probability ≥ {MIN_PROB_SCAN}% and RR ≥ {MIN_RR}."
+        "🚀 Auto-scan started.\n\n"
+        "- Every 5 minutes I scan MEXC USDT futures with ≥ 50M 24h volume.\n"
+        "- I only send signals when probability ≥ 85% and RR ≥ 1:1.9.\n"
+        "- I focus on VWAP + fixed-range volume profile + candle confirmation.\n"
+        "- There is a ~10 minute cooldown after sending signals.\n\n"
+        "You can still request manual analysis anytime, e.g.:\n"
+        "`/suiusdt 4h` or `/btcusdt` (multi-timeframe)\n\n"
+        "⚠️ Futures trading is risky. Use position sizing and your own judgment.",
+        parse_mode="Markdown",
     )
 
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global SCAN_ENABLED
-    SCAN_ENABLED = False
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /stop: stop autoscan for this chat.
+    """
+    chat_id = update.effective_chat.id
+    job = AUTOSCAN_JOBS.pop(chat_id, None)
+    if job:
+        job.schedule_removal()
+        await update.message.reply_text(
+            "🛑 Auto-scan stopped.\n\n"
+            "You can still ask for manual analysis, e.g. `/ethusdt 1h`.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("Auto-scan is not running for this chat.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⏹ Auto-scanner OFF. Manual analysis still works."
+        "📈 Gemini + MEXC Futures Analysis Bot\n\n"
+        "**Manual analysis:**\n"
+        "- `/btcusdt` → multi-timeframe analysis (5m → 1W)\n"
+        "- `/suiusdt 4h` → analysis only on 4h\n\n"
+        "I give probabilities of Upside / Downside / Flat.\n"
+        "If the best scenario ≥ 75% I also suggest entry / SL / TP.\n\n"
+        "**Auto-scan:**\n"
+        "- `/start` → start auto-scan (5m, VWAP + volume profile focus)\n"
+        "- `/stop` → stop auto-scan\n\n"
+        "⚠️ Signals are NOT guaranteed. Use them as decision support only.",
+        parse_mode="Markdown",
     )
 
 
-async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles commands like /btcusdt or /ethusdt.
+    Background job:
+      - Runs every 5 minutes
+      - Scans high-volume pairs
+      - Calls Gemini for each candidate
+      - Sends only strong signals (prob ≥ 85%, RR ≥ 1.9)
+      - Enforces 10-min cooldown after sending signals
     """
-    if not update.message:
+    job_data = context.job.data or {}
+    chat_id = job_data.get("chat_id")
+    last_signal_time = float(job_data.get("last_signal_time", 0.0))
+    now = time.time()
+
+    # Cooldown check
+    if last_signal_time and (now - last_signal_time) < COOLDOWN_SEC:
+        logger.info(f"Autoscan cooldown active for chat {chat_id}")
+        return
+
+    symbols = fetch_high_volume_symbols()
+    if not symbols:
+        logger.info("No high-volume symbols found this scan.")
+        return
+
+    logger.info(f"Autoscan symbols: {symbols}")
+
+    messages = []
+
+    for symbol in symbols:
+        candles = fetch_mexc_klines(symbol, "Min5", limit=200)
+        if len(candles) < 50:
+            continue
+
+        csv = format_ohlcv_for_prompt(candles, max_rows=150)
+        contents = build_autoscan_prompt(symbol, "5m", csv)
+        data = call_gemini_for_json(contents)
+        if not data:
+            continue
+
+        dominant = data.get("dominant_scenario")
+        upside_prob = int(data.get("upside_prob", 0))
+        downside_prob = int(data.get("downside_prob", 0))
+        flat_prob = int(data.get("flat_prob", 0))
+        trade_plan = data.get("trade_plan")
+
+        highest = max(upside_prob, downside_prob, flat_prob)
+        if highest < 85 or not trade_plan:
+            continue
+
+        direction = trade_plan.get("direction")
+        entry = trade_plan.get("entry")
+        sl = trade_plan.get("stop_loss")
+        tps = trade_plan.get("take_profits") or []
+        min_rr = trade_plan.get("min_rr", 0.0)
+
+        if not direction or entry is None or sl is None or not tps:
+            continue
+
+        tp_str = ", ".join(f"{tp:.6f}" for tp in tps)
+        msg = (
+            f"📡 [AUTO] {symbol}\n"
+            f"Direction: {direction.upper()}\n"
+            f"Probabilities → Up {upside_prob}%, Down {downside_prob}%, Flat {flat_prob}%\n"
+            f"Entry: {entry:.6f}\n"
+            f"SL: {sl:.6f}\n"
+            f"TP: {tp_str}\n"
+            f"Min RR: {min_rr:.2f}"
+        )
+        messages.append(msg)
+
+    if messages:
+        all_text = "\n\n".join(messages)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=all_text)
+            job_data["last_signal_time"] = now
+            context.job.data = job_data
+        except Exception as e:
+            logger.exception(f"Error sending autoscan messages: {e}")
+
+
+async def analyze_coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Catch-all for commands that are NOT /start /stop /help.
+    We treat them as coin commands like:
+      /suiusdt
+      /suiusdt 4h
+    """
+    if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
+    # Remove leading '/'
+    text_no_slash = text.lstrip("/")
+    parts = text_no_slash.split()
 
-    # Remove leading "/" and any arguments after a space
-    if text.startswith("/"):
-        symbol = text[1:].split()[0].upper()
-    else:
-        symbol = text.replace("/", "").split()[0].upper()
-
-    if not symbol.endswith("USDT"):
-        await update.message.reply_text(
-            "Send coin like: `/btcusdt` or `/ethusdt`", parse_mode="Markdown"
-        )
+    if not parts:
         return
 
-    await update.message.reply_text(f"⏳ Analysing {symbol}...")
+    cmd = parts[0]
+    tf_arg = parts[1].lower() if len(parts) > 1 else None
 
-    try:
-        result = await analyze_manual(symbol)
-    except Exception as e:
-        print("handle_pair error:", e)
-        result = f"❌ Error analysing {symbol}: {e}"
+    symbol = symbol_from_command(cmd)
+    requested_tf = None
+    requested_tf_label = None
 
-    await update.message.reply_markdown(result)
+    if tf_arg and tf_arg in TIMEFRAME_MAP:
+        requested_tf, requested_tf_label = TIMEFRAME_MAP[tf_arg]
 
-
-# ============================================================
-# POST_INIT + MAIN
-# ============================================================
-
-async def post_init(app):
-    # start scanner loop
-    app.create_task(scanner_loop(app))
-
-
-def main():
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
+    await update.message.reply_text(
+        f"🔍 Fetching MEXC data for *{symbol}* "
+        f"{'('+requested_tf_label+')' if requested_tf_label else '(multi-timeframe)'} ...",
+        parse_mode="Markdown",
     )
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("stop", cmd_stop))
+    # Fetch OHLCV data
+    tf_blocks = {}
 
-    # Any other command → treated as coin, e.g. /btcusdt
+    if requested_tf:
+        candles = fetch_mexc_klines(symbol, requested_tf, limit=200)
+        if not candles:
+            await update.message.reply_text("❌ Could not fetch candles for that pair/timeframe.")
+            return
+        tf_blocks[requested_tf_label] = format_ohlcv_for_prompt(candles, max_rows=150)
+    else:
+        # Multi-timeframe
+        for interval, label in MULTI_TF_DEFAULTS:
+            candles = fetch_mexc_klines(symbol, interval, limit=200)
+            if candles:
+                tf_blocks[label] = format_ohlcv_for_prompt(candles, max_rows=150)
+
+        if not tf_blocks:
+            await update.message.reply_text("❌ Could not fetch market data for that pair.")
+            return
+
+    contents = build_manual_analysis_prompt(symbol, tf_blocks, requested_tf_label)
+    data = call_gemini_for_json(contents)
+    if not data:
+        await update.message.reply_text("❌ Gemini could not produce a valid analysis this time. Try again.")
+        return
+
+    upside_prob = int(data.get("upside_prob", 0))
+    downside_prob = int(data.get("downside_prob", 0))
+    flat_prob = int(data.get("flat_prob", 0))
+    dominant = data.get("dominant_scenario", "unknown")
+    trade_plan = data.get("trade_plan")
+    summary = data.get("summary", "").strip()
+
+    highest = max(upside_prob, downside_prob, flat_prob)
+
+    # Build response text
+    lines = []
+    lines.append(f"📊 *{symbol}* analysis")
+    if requested_tf_label:
+        lines.append(f"Timeframe: *{requested_tf_label}*")
+    else:
+        lines.append("Timeframe: *Multi-timeframe (5m → 1W)*")
+
+    lines.append("")
+    lines.append(f"Upside: {upside_prob}%")
+    lines.append(f"Downside: {downside_prob}%")
+    lines.append(f"Flat/Choppy: {flat_prob}%")
+    lines.append(f"Dominant scenario: *{dominant.upper()}*")
+    lines.append("")
+
+    if trade_plan and highest >= 75 and dominant in ("upside", "downside"):
+        direction = trade_plan.get("direction")
+        entry = trade_plan.get("entry")
+        sl = trade_plan.get("stop_loss")
+        tps = trade_plan.get("take_profits") or []
+        min_rr = trade_plan.get("min_rr", 0.0)
+
+        if direction and entry is not None and sl is not None and tps:
+            tp_str = ", ".join(f"{tp:.6f}" for tp in tps)
+            lines.append("🎯 *Trade idea* (for study, not financial advice):")
+            lines.append(f"- Direction: *{direction.upper()}*")
+            lines.append(f"- Entry: `{entry:.6f}`")
+            lines.append(f"- Stop-loss (beyond key S/R): `{sl:.6f}`")
+            lines.append(f"- Take profits: `{tp_str}`")
+            lines.append(f"- Min RR: `{min_rr:.2f}`")
+            lines.append("")
+        else:
+            lines.append("No clean trade plan extracted from the model.")
+    else:
+        lines.append(
+            "⚠️ No trade plan suggested (edge < 75% or market too choppy). "
+            "Consider waiting for cleaner structure."
+        )
+        lines.append("")
+
+    if summary:
+        lines.append(f"🧠 Summary: {summary}")
+
+    lines.append("")
+    lines.append("⚠️ This is *decision support*, not guaranteed profit. Manage risk and size carefully.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(msg="Exception while handling update:", exc_info=context.error)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Core commands
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("help", help_command))
+
+    # Any other command → treat as /coin [tf]
     application.add_handler(
         MessageHandler(
-            filters.COMMAND & ~filters.Regex(r"^/(start|stop)$"),
-            handle_pair,
+            filters.COMMAND & ~filters.Regex(r"^/(start|stop|help)$"),
+            analyze_coin_command,
         )
     )
 
-    print("Bot running...")
-    application.run_polling()
+    application.add_error_handler(error_handler)
+
+    logger.info("Bot starting with polling...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-

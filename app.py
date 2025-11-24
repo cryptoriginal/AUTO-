@@ -26,8 +26,19 @@ OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0") or "0")
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN env var is required")
 
-# Gemini client uses GEMINI_API_KEY env by default
-gemini_client = genai.Client()
+# ----- GEMINI / GOOGLE AI API KEY -----
+# Try both env var names and then pass explicitly to the client
+_GEMINI_KEY = (
+    os.getenv("GEMINI_API_KEY", "").strip()
+    or os.getenv("GOOGLE_API_KEY", "").strip()
+)
+
+if not _GEMINI_KEY:
+    raise RuntimeError(
+        "No Gemini API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY in Render."
+    )
+
+gemini_client = genai.Client(api_key=_GEMINI_KEY)
 
 MEXC_FUTURES_BASE = "https://contract.mexc.com"
 SCAN_INTERVAL_SEC = 5 * 60      # every 5 minutes
@@ -205,7 +216,6 @@ def format_ohlcv_for_prompt(candles, max_rows=150):
     lines = ["time,open,high,low,close,volume"]
     for c in candles:
         ts = int(c["time"])
-        # convert key to readable UTC time (optional)
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         lines.append(
             f"{dt},{c['open']:.6f},{c['high']:.6f},{c['low']:.6f},{c['close']:.6f},{c['volume']:.2f}"
@@ -214,10 +224,6 @@ def format_ohlcv_for_prompt(candles, max_rows=150):
 
 
 def build_manual_analysis_prompt(symbol: str, tf_blocks: dict, requested_tf_label: str | None):
-    """
-    Build the prompt for manual /coin analysis.
-    tf_blocks: { "5m": "csv string", "15m": "csv string", ... }
-    """
     scope_text = (
         f"Focus ONLY on timeframe: {requested_tf_label}.\n"
         "Treat it as the main decision frame. Ignore other timeframes."
@@ -266,9 +272,9 @@ Return STRICTLY valid JSON, no extra text, no markdown, no commentary.
 
 JSON SCHEMA:
 {{
-  "upside_prob": int,   // 0-100
-  "downside_prob": int, // 0-100
-  "flat_prob": int,     // 0-100
+  "upside_prob": int,
+  "downside_prob": int,
+  "flat_prob": int,
   "dominant_scenario": "upside" | "downside" | "flat",
   "trade_plan": null | {{
      "direction": "long" | "short",
@@ -288,11 +294,6 @@ Return ONLY this JSON object.
 
 
 def build_autoscan_prompt(symbol: str, tf_label: str, csv_block: str):
-    """
-    Build prompt for auto-scan signals.
-    Focus: VWAP + fixed range volume profile between last swing high/low + candles.
-    Threshold for trade_plan: 85%.
-    """
     prompt = f"""
 You are a crypto futures scalping expert, focused on VWAP and fixed-range volume profile.
 
@@ -364,11 +365,9 @@ def call_gemini_for_json(contents):
             contents=contents,
         )
         raw = response.text
-        # Sometimes models wrap JSON in ```json ```; strip if needed.
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.strip("`")
-            # Might be like json\n{...}
             if "\n" in raw:
                 raw = raw.split("\n", 1)[1]
         data = json.loads(raw)
@@ -383,11 +382,6 @@ def call_gemini_for_json(contents):
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /start:
-      - Send welcome message
-      - Start autoscan job for this chat (if not already)
-    """
     chat_id = update.effective_chat.id
 
     if chat_id in AUTOSCAN_JOBS:
@@ -401,7 +395,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = context.job_queue.run_repeating(
         autoscan_job,
         interval=SCAN_INTERVAL_SEC,
-        first=5,  # start after 5 seconds
+        first=5,
         data={"chat_id": chat_id, "last_signal_time": 0.0},
         name=f"autoscan_{chat_id}",
     )
@@ -421,9 +415,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /stop: stop autoscan for this chat.
-    """
     chat_id = update.effective_chat.id
     job = AUTOSCAN_JOBS.pop(chat_id, None)
     if job:
@@ -454,20 +445,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Background job:
-      - Runs every 5 minutes
-      - Scans high-volume pairs
-      - Calls Gemini for each candidate
-      - Sends only strong signals (prob ≥ 85%, RR ≥ 1.9)
-      - Enforces 10-min cooldown after sending signals
-    """
     job_data = context.job.data or {}
     chat_id = job_data.get("chat_id")
     last_signal_time = float(job_data.get("last_signal_time", 0.0))
     now = time.time()
 
-    # Cooldown check
     if last_signal_time and (now - last_signal_time) < COOLDOWN_SEC:
         logger.info(f"Autoscan cooldown active for chat {chat_id}")
         return
@@ -534,17 +516,10 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analyze_coin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Catch-all for commands that are NOT /start /stop /help.
-    We treat them as coin commands like:
-      /suiusdt
-      /suiusdt 4h
-    """
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
-    # Remove leading '/'
     text_no_slash = text.lstrip("/")
     parts = text_no_slash.split()
 
@@ -567,7 +542,6 @@ async def analyze_coin_command(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
     )
 
-    # Fetch OHLCV data
     tf_blocks = {}
 
     if requested_tf:
@@ -577,7 +551,6 @@ async def analyze_coin_command(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         tf_blocks[requested_tf_label] = format_ohlcv_for_prompt(candles, max_rows=150)
     else:
-        # Multi-timeframe
         for interval, label in MULTI_TF_DEFAULTS:
             candles = fetch_mexc_klines(symbol, interval, limit=200)
             if candles:
@@ -602,7 +575,6 @@ async def analyze_coin_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     highest = max(upside_prob, downside_prob, flat_prob)
 
-    # Build response text
     lines = []
     lines.append(f"📊 *{symbol}* analysis")
     if requested_tf_label:
@@ -662,12 +634,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Core commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("help", help_command))
 
-    # Any other command → treat as /coin [tf]
     application.add_handler(
         MessageHandler(
             filters.COMMAND & ~filters.Regex(r"^/(start|stop|help)$"),

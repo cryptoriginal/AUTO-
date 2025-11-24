@@ -1,6 +1,6 @@
 # ============================================================
 # FULL APP.PY — BACKGROUND SCANNER + MANUAL ANALYSIS
-# Bybit data + Gemini 2.5 + BingX autotrade
+# Bybit data + Gemini + BingX autotrade
 # NO JobQueue, works on Render with PTB 20+
 # ============================================================
 
@@ -40,11 +40,12 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("Missing GEMINI_API_KEY")
 
-# Use latest Gemini 2.5 Flash experimental by default
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-exp")
+# Default: stable, high-quality model
+# You can override via env: GEMINI_MODEL=gemini-1.5-flash etc.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
 
-# scanner / trade settings
-SCAN_INTERVAL_SECONDS = 300          # background scan interval
+# Scanner / trade settings
+SCAN_INTERVAL_SECONDS = 300          # background scan interval (5 min)
 SIGNAL_COOLDOWN_SECONDS = 600        # 10 min cooldown per (symbol, direction)
 MIN_VOLUME = 50_000_000              # Bybit 24h turnover filter
 MIN_PROB_SCAN = 80                   # autoscan probability threshold
@@ -56,7 +57,8 @@ AUTO_MAX_POSITIONS = 2
 SCAN_ENABLED = True
 SUPPORTED_BINGX = set()
 auto_open_positions = set()
-last_signal_time = {}  # (symbol, direction) -> last timestamp
+# (symbol, direction) -> last timestamp
+last_signal_time: dict[tuple[str, str], float] = {}
 
 
 # ============================================================
@@ -68,15 +70,19 @@ gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 bingx = None
 if BINGX_API_KEY and BINGX_API_SECRET:
-    # Try a few common constructor styles to be tolerant to versions
+    # Try to initialise BingX in a version-tolerant way
     try:
         bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET)
+        print("[BINGX] Initialised BingxAPI(key, secret)")
     except TypeError:
         try:
             bingx = BingxAPI(BINGX_API_KEY, BINGX_API_SECRET, timestamp="local")
+            print("[BINGX] Initialised BingxAPI(key, secret, timestamp='local')")
         except Exception as e:
             print("BingxAPI init error:", e)
             bingx = None
+else:
+    print("[BINGX] API key/secret not set — autotrade disabled.")
 
 
 # ============================================================
@@ -192,9 +198,9 @@ def load_supported_bingx_symbols():
         return
 
     try:
+        # Try the most common method
         data = bingx.get_all_contracts()
     except AttributeError:
-        # fallback to older method names if needed
         try:
             data = bingx.swap_v2_get_contracts()
         except Exception as e:
@@ -274,7 +280,7 @@ def force_json(text: str):
     except Exception:
         pass
 
-    # strip markdown fences like ```json ... ``` / ```
+    # strip markdown fences like ```json ... ```
     cleaned = re.sub(r"```(?:json)?", "", text)
     cleaned = cleaned.replace("```", "")
 
@@ -306,18 +312,9 @@ def force_json(text: str):
 def ask_gemini_json(prompt: str):
     """
     Call Gemini and return parsed JSON (or {}).
-    Uses response_mime_type='application/json' to force JSON output.
     """
     try:
-        resp = gemini_model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.25,
-                "top_p": 0.9,
-                "max_output_tokens": 2048,
-                "response_mime_type": "application/json",
-            },
-        )
+        resp = gemini_model.generate_content(prompt)
         txt = (resp.text or "").strip()
         return force_json(txt)
     except Exception as e:
@@ -331,15 +328,7 @@ def ask_gemini_text(prompt: str) -> str:
     Used as fallback when JSON is unusable.
     """
     try:
-        resp = gemini_model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.4,
-                "top_p": 0.9,
-                "max_output_tokens": 512,
-                "response_mime_type": "text/plain",
-            },
-        )
+        resp = gemini_model.generate_content(prompt)
         return (resp.text or "").strip()
     except Exception as e:
         print("Gemini text error:", e)
@@ -359,24 +348,13 @@ Analyse:
 - Current price: {price}
 - Candles JSON: {json.dumps(candles)}
 
-Focus on:
-- Trend direction (uptrend, downtrend, ranging)
-- Key support & resistance zones
-- VWAP behaviour
-- Fixed range volume profile zones (high volume nodes, low volume nodes)
-- Reversal candles (hammer, shooting star, engulfing, doji) at key levels.
-
-We only want VERY CLEAN setups.
+Focus on trend, key levels, VWAP behaviour, volume profile and reversal candles.
+Decide ONLY if there is a very clean setup.
 
 Rules:
-- If there is no clean, high-probability setup, respond with:
-  "direction": "flat",
-  "probability": 0,
-  and set "entry", "stop", "tp1" to 0.
-- If there IS a clean setup:
-  * direction must be "long" or "short"
-  * probability must be between 80 and 100
-  * rr must be at least {MIN_RR} (RR = distance to TP / distance to stop)
+- If probability that price reaches TP1 before SL is >= {MIN_PROB_SCAN}% and RR >= {MIN_RR},
+  return a trade with direction "long" or "short".
+- Otherwise, return direction "flat".
 
 Return ONLY valid JSON in this exact schema:
 
@@ -395,33 +373,20 @@ Return ONLY valid JSON in this exact schema:
 
 def build_manual_prompt(symbol, snapshot, price):
     return f"""
-You are a world-class crypto futures trader.
+You are a world-class crypto trader.
 
 Symbol: {symbol}
 Current price: {price}
-Snapshot (multi-timeframe OHLCV JSON): {json.dumps(snapshot)}
+Snapshot: {json.dumps(snapshot)}
 
-Steps:
-1. Evaluate the probabilities (integer 0–100) for:
-   - upside (price moves up and breaks recent swing highs)
-   - downside (price moves down and breaks recent swing lows)
-   - flat (choppy, no edge, avoid trading)
-   These should roughly sum to 100.
+1. Evaluate upside, downside and flat probabilities (0-100 each).
+2. Choose "direction": "long", "short" or "flat".
+3. If direction is long/short AND its probability >= 80,
+   propose entry, stop, tp1, tp2 based on key levels
+   (recent swing high/low, reversal candle, strong support/resistance).
+4. If no good trade, set entry/stop/tp1/tp2 to null.
 
-2. Choose "direction":
-   - "long" if upside is clearly best,
-   - "short" if downside is clearly best,
-   - "flat" if there is no edge or price is choppy.
-
-3. If direction is "long" or "short" AND its probability >= 80,
-   propose:
-   - entry: near current price but not random,
-   - stop: at a logical key level (swing high/low, reversal candle, clear S/R),
-   - tp1 and tp2: realistic targets in the direction of the trade.
-
-4. If there is NO good trade (best probability < 80), set entry, stop, tp1, tp2 to null.
-
-Return ONLY JSON in this exact schema:
+Return ONLY JSON:
 
 {{
  "symbol": "{symbol}",
@@ -483,13 +448,13 @@ to look for longs, shorts or stay flat. Do NOT return JSON, just text.
     summary = data.get("summary", "-")
     up = int(data.get("upside", 0))
     down = int(data.get("downside", 0))
-    flat = int(data.get("flat", 0))
+    flat_p = int(data.get("flat", 0))
 
     lines = [
         f"📊 *{symbol} Analysis*",
         f"Price: `{price}`",
         f"Direction: *{direction}*",
-        f"Upside: `{up}%`  Downside: `{down}%`  Flat: `{flat}%`",
+        f"Upside: `{up}%`  Downside: `{down}%`  Flat: `{flat_p}%`",
         f"Reason: _{summary}_",
     ]
 
@@ -760,7 +725,7 @@ async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app):
     # load BingX symbols once (in background thread)
     await asyncio.to_thread(load_supported_bingx_symbols)
-    # start scanner loop
+    # start scanner loop (async, no JobQueue)
     app.create_task(scanner_loop(app))
 
 

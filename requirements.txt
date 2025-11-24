@@ -1,4 +1,3 @@
-python-telegram-bot==13.15
-google-generativeai==0.6.6
-requests==2.32.3
-py-bingx==0.2.0
+python-telegram-bot==20.7
+google-generativeai==0.7.2
+requests

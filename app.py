@@ -1,6 +1,6 @@
 # ================================
 # GEMINI + MEXC FUTURES TG BOT
-# - Autoscan (VWAP + Volume Profile)
+# - Autoscan (Volume spike + Fixed Range VP)
 # - Manual Analysis (multi-TF)
 # - Optional BingX USDT-M auto-trade (MARKET, 7x)
 # For Render Background Worker
@@ -298,17 +298,22 @@ def bingx_place_market_order(symbol: str, direction: str) -> dict | None:
 
 
 # ============================================================
-# GEMINI CALL
+# GEMINI CALL (LOWER TEMPERATURE FOR CONSISTENCY)
 # ============================================================
 
 def ask_gemini(contents):
     """
     Call Gemini and parse JSON from response.
+    Lower temperature to reduce flip-flop signals.
     """
     try:
         resp = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=contents,
+            generation_config={
+                "temperature": 0.2,   # lower randomness
+                "top_p": 0.8,
+            },
         )
         text = resp.text.strip()
 
@@ -329,9 +334,20 @@ def ask_gemini(contents):
 # ============================================================
 
 def build_autoscan_prompt(symbol: str, csv_block: str):
+    """
+    Autoscan: now focused on
+    - sudden volume spike
+    - fixed-range volume profile
+    - price action + candlestick
+    Threshold: 82%+
+    """
     return [
         f"""
-You are a crypto futures scalping expert focused on VWAP + fixed-range volume profile.
+You are a crypto futures scalping expert focused on:
+
+- Sudden volume spikes
+- Fixed-range volume profile between recent swing high and low
+- Price action and candlestick confirmations (engulfing, hammers, strong rejection wicks, etc.)
 
 Exchange: MEXC Futures
 Contract: {symbol}
@@ -339,35 +355,37 @@ Timeframe: 5m
 
 Data:
 - OHLCV given as CSV: time,open,high,low,close,volume.
-- Approximate:
-  - Session VWAP / intraday VWAP interactions.
-  - Fixed-range volume profile between last major swing high & swing low.
-  - High-volume nodes / low-volume areas.
-- Combine this with candlestick patterns and structure.
+- Use it to approximate:
+  - Where the most recent swing high and swing low are.
+  - Fixed-range volume profile inside that swing (high-volume nodes / low-volume areas).
+  - Any SUDDEN VOLUME SPIKE in the last few candles compared to the recent average.
+  - Structure: trend direction, breakouts, rejections, etc.
 
 Task:
 - Estimate probability (0-100%) of:
-  1) Upside move (trend up)
-  2) Downside move (trend down)
+  1) Upside move (trend up continuation or breakout)
+  2) Downside move (trend down continuation or breakdown)
   3) Flat / choppy (avoid trades)
 
 - Pay special attention to:
-  - Price reaction at VWAP (bounces, rejections, reclaims).
-  - Price at volume profile extremes (HVN/LVN) within last swing.
-  - Candle confirmation (wicks, engulfing, hammers, etc).
+  - Sudden volume spike near an important level in the volume profile.
+  - Breakouts / fakeouts visible in price action.
+  - Candlestick confirmation at key levels.
 
 Trade rules:
-- Let highest_prob be max(upside_prob, downside_prob, flat_prob).
-- If highest_prob < 85 → trade_plan = null (NO TRADE).
-- If highest_prob >= 85:
+- First, estimate realistic probabilities purely from the data.
+- Do NOT force probabilities toward any threshold. It is OK if all three are below 82%.
+- Let highest_prob = max(upside_prob, downside_prob, flat_prob).
+- If highest_prob < 82 → trade_plan = null (NO TRADE).
+- If highest_prob >= 82:
     - If dominant scenario is upside → LONG.
     - If dominant scenario is downside → SHORT.
-    - Entry at logical level aligned with VWAP + volume profile + structure.
+    - Entry at logical level supported by volume profile + price action (e.g., retest of breakout, rejection candle at key node).
     - SL beyond meaningful swing high/low (not tight, avoid stop hunts).
     - 1-2 TP levels, minimum RR >= 1.9.
 
 Output:
-Return ONLY valid JSON:
+Return ONLY valid JSON (no explanation text):
 
 {{
   "upside_prob": int,
@@ -388,6 +406,9 @@ Return ONLY valid JSON:
 
 
 def build_manual_prompt(symbol: str, tf_blocks: dict, requested_tf_label: str | None):
+    """
+    Manual analysis: more realistic probabilities, no hard bias to 75%.
+    """
     if requested_tf_label:
         scope = (
             f"Focus ONLY on timeframe: {requested_tf_label}. "
@@ -396,7 +417,7 @@ def build_manual_prompt(symbol: str, tf_blocks: dict, requested_tf_label: str | 
     else:
         scope = (
             "Use MULTI-TIMEFRAME analysis: "
-            "weekly & daily for bias, 4h/1h for structure, 15m/5m for timing."
+            "weekly & daily for bias, 4h/1h for structure, 15m/5m for entry timing."
         )
 
     tf_texts = []
@@ -412,25 +433,30 @@ Contract: {symbol}
 {scope}
 
 Goals:
-- Estimate probability (0-100%) for next meaningful move:
+- Estimate probability (0-100%) for the next meaningful move:
   1) Upside (sustained bullish move)
   2) Downside (sustained bearish move)
   3) Flat / choppy / range where trade should be avoided.
 
 When reasoning:
-- Consider trend, HH/HL / LH/LL, key S/R, liquidity zones.
-- Consider candles (hammer, doji, engulfing, pin bars), wicks, rejections.
-- Consider basic patterns (flags, wedges, ranges).
-- Approximate RSI / MACD / MAs mentally from OHLCV.
-- Be conservative → only give trade when edge is clear.
+- Consider trend, HH/HL / LH/LL, key support/resistance, liquidity zones.
+- Consider candlestick patterns (hammer, doji, engulfing, pin bars), wicks, rejections.
+- Consider basic chart patterns (flags, wedges, ranges, breakouts/breakdowns).
+- Approximate RSI / MACD / moving averages mentally from OHLCV.
+- Be conservative → only give a trade when edge is clearly one-sided.
+
+VERY IMPORTANT:
+- First, estimate realistic probabilities purely from the data, even if they are all < 75.
+- Do NOT try to game the rules by always returning exactly 75%. Use natural, varied probabilities (e.g., 63%, 71%, 82%, etc.)
+- If the market is messy / conflicting → increase flat_prob and avoid giving a trade.
 
 Trade rules:
 - Let highest_prob = max(upside_prob, downside_prob, flat_prob).
-- If highest_prob < 75 → trade_plan = null.
+- If highest_prob < 75 → trade_plan = null (means: avoid trade).
 - If highest_prob >= 75:
     - If dominant scenario is upside → LONG.
     - If dominant scenario is downside → SHORT.
-    - Entry near logical level (retest, key S/R, VWAP-like areas).
+    - Entry near a logical level (retest, key S/R, trendline / breakout level, volume-profile node).
     - SL beyond meaningful swing high/low (avoid easy stop hunts).
     - 1-2 TP levels with minimum RR >= 1.9.
 
@@ -465,8 +491,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 Auto-scan started.\n\n"
         "- Every 5 minutes I scan MEXC USDT futures with ≥ 50M 24h volume.\n"
-        "- I only send signals when probability ≥ 85% and RR ≥ 1.9.\n"
-        "- Focus: VWAP + fixed-range volume profile + candle confluence.\n"
+        "- I only send signals when probability ≥ 82% and RR ≥ 1.9.\n"
+        "- Focus: sudden volume spikes + fixed-range volume profile + price action + candles.\n"
         "- Cooldown ~10 minutes after sending signals.\n\n"
         f"Auto-trade on BingX: {'ON ✅' if BINGX_ENABLE_AUTOTRADE else 'OFF ❌'}\n"
         "Manual analysis still works, e.g. `/btcusdt` or `/suiusdt 4h`."
@@ -502,13 +528,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📈 Gemini + MEXC Futures Bot\n\n"
         "Auto-scan:\n"
-        "- /start → begin autoscan (5m, VWAP + volume profile)\n"
+        "- /start → begin autoscan (5m, volume spike + fixed-range VP + price action)\n"
         "- /stop → stop autoscan\n\n"
         "Manual analysis:\n"
         "- `/btcusdt` → multi-TF (5m→1W) analysis\n"
         "- `/suiusdt 4h` → analysis only on 4h\n"
         "- `/ethusdt 15m` → analysis only on 15m\n\n"
         f"Auto-trade: {'ENABLED (BingX MARKET 7x)' if BINGX_ENABLE_AUTOTRADE else 'DISABLED'}\n"
+        "I only give entry/SL/TP if highest probability ≥ 75%. "
+        "Below 75% I will tell you to avoid the trade.\n\n"
         "Use this as decision support, not guaranteed profit. Futures = high risk."
         ,
         parse_mode="Markdown",
@@ -552,7 +580,7 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
         plan = data.get("trade_plan")
 
         highest = max(up, down, flat)
-        if highest < 85 or not plan:
+        if highest < 82 or not plan:
             continue
 
         direction = plan.get("direction")
@@ -694,8 +722,8 @@ async def coin_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("No clean trade plan extracted.")
     else:
         lines.append(
-            "⚠️ No trade plan suggested (edge < 75% or market too choppy). "
-            "Better to wait for a cleaner setup."
+            "⚠️ Highest probability is below 75% or market is too choppy.\n"
+            "➡️ Better to avoid this trade and wait for a clearer setup."
         )
         lines.append("")
 

@@ -1,10 +1,9 @@
 # ================================
-# GEMINI + MEXC CRYPTO ANALYSIS BOT
-# Balanced mode:
-# - Manual multi-TF analysis
-# - Autoscan (volume spike + FRVP style)
+# GEMINI + MEXC CRYPTO ANALYSIS BOT (Balanced, JSON-Stable)
+# - Manual analysis (/btcusdt, /suiusdt 4h, etc.)
+# - Autoscan (5m, volume spike + FRVP-style + PA)
 # - Optional BingX auto-trade (MARKET, 7x)
-# - Strong JSON handling with fallback
+# - Uses response_mime_type="application/json" for stable parsing
 # ================================
 
 import os
@@ -17,6 +16,7 @@ from datetime import datetime, timezone
 
 import requests
 from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -46,15 +46,15 @@ gemini_client = genai.Client(api_key=GEMINI_KEY)
 MEXC_URL = "https://contract.mexc.com"
 
 # Autoscan config
-SCAN_INTERVAL = 300           # 5 min
-COOLDOWN = 600                # 10 min
+SCAN_INTERVAL = 300      # 5m
+COOLDOWN = 600           # 10m cooldown after signals
 MAX_COINS = 20
 AUTOSCAN = {}
 
-# Candles per timeframe (balanced)
+# Candles per TF (balanced)
 MAX_CANDLES = 60
 
-# Manual TF map
+# Manual timeframe map
 TIMEFRAME_MAP = {
     "5m": ("Min5", "5m"),
     "15m": ("Min15", "15m"),
@@ -62,7 +62,7 @@ TIMEFRAME_MAP = {
     "4h": ("Hour4", "4h"),
     "1d": ("Day1", "1D"),
 }
-# Multi-TF default (balanced)
+# Multi-TF default for manual analysis
 MULTI_TF = [
     ("Min5", "5m"),
     ("Min60", "1h"),
@@ -70,7 +70,7 @@ MULTI_TF = [
     ("Day1", "1D"),
 ]
 
-# BingX auto-trade
+# BingX auto-trade config
 BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
 BINGX_ENABLE_AUTOTRADE = os.getenv("BINGX_ENABLE_AUTOTRADE", "false").lower() == "true"
@@ -90,7 +90,7 @@ log = logging.getLogger("bot")
 
 
 # ============================================================
-# BASIC HELPERS
+# BASIC HELPERS (MEXC)
 # ============================================================
 
 def symbol_format(cmd: str) -> str:
@@ -109,7 +109,7 @@ def get_mexc_candles(symbol: str, interval: str, limit: int = MAX_CANDLES):
         interval_sec = {
             "Min1": 60, "Min5": 300, "Min15": 900,
             "Min60": 3600, "Hour4": 14400,
-            "Day1": 86400, "Week1": 604800
+            "Day1": 86400, "Week1": 604800,
         }.get(interval, 300)
         start_ts = now - interval_sec * limit
         r = requests.get(
@@ -169,32 +169,60 @@ def get_high_volume_coins(min_vol=50_000_000):
 
 
 # ============================================================
-# STRONG JSON HANDLING
+# GEMINI JSON CALL (FORCED JSON OUTPUT)
 # ============================================================
 
-def extract_clean_json(raw: str):
+def parse_json_text(text: str):
     """
-    Try to extract a valid JSON object from raw text.
-    - Strips ```json ... ``` fences
-    - Slices from first '{' to last '}'
+    Handle both:
+      - pure JSON: {"a":1}
+      - JSON-as-string: "{\"a\":1}"
     """
-    if not raw:
+    if not text:
         return None
-    txt = raw.strip()
-    txt = txt.replace("```json", "").replace("```", "").strip()
-    if "{" not in txt or "}" not in txt:
-        return None
-    start = txt.find("{")
-    end = txt.rfind("}")
-    snippet = txt[start : end + 1]
     try:
-        return json.loads(snippet)
+        obj = json.loads(text)
+        if isinstance(obj, str):
+            try:
+                return json.loads(obj)
+            except Exception:
+                return None
+        return obj
     except Exception as e:
-        log.error(f"extract_clean_json json.loads failed: {e}")
+        log.error(f"json.loads error: {e}")
         return None
 
 
-AUTOSCAN_SCHEMA_HINT = """
+def gemini_json(contents):
+    """
+    Call Gemini with response_mime_type='application/json'
+    So resp.text should always be JSON or JSON string.
+    """
+    try:
+        resp = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.15,
+                top_p=0.8,
+            ),
+        )
+        txt = (resp.text or "").strip()
+        obj = parse_json_text(txt)
+        if obj is None:
+            log.error(f"Gemini JSON parse failed. Raw (truncated): {txt[:500]}")
+        return obj
+    except Exception as e:
+        log.error(f"Gemini API error: {e}")
+        return None
+
+
+# ============================================================
+# PROMPTS
+# ============================================================
+
+AUTOSCAN_SCHEMA_DESC = """
 {
   "upside_prob": int,
   "downside_prob": int,
@@ -210,7 +238,7 @@ AUTOSCAN_SCHEMA_HINT = """
 }
 """
 
-MANUAL_SCHEMA_HINT = """
+MANUAL_SCHEMA_DESC = """
 {
   "upside_prob": int,
   "downside_prob": int,
@@ -228,100 +256,40 @@ MANUAL_SCHEMA_HINT = """
 """
 
 
-def ask_gemini_with_schema(contents, schema_hint: str):
-    """
-    Balanced JSON-safe call:
-    1) Ask model to compute + return JSON
-    2) Try to parse
-    3) If invalid → second call: "convert this text to JSON"
-    """
-    # ---- First attempt: full logic ----
-    try:
-        resp1 = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-            generation_config={"temperature": 0.15, "top_p": 0.8},
-        )
-        raw1 = (resp1.text or "").strip()
-        parsed1 = extract_clean_json(raw1)
-        if parsed1 is not None:
-            return parsed1
-        log.warning(f"First Gemini call produced non-JSON, attempting fix. Raw (truncated): {raw1[:500]}")
-    except Exception as e:
-        log.error(f"Gemini first call error: {e}")
-        raw1 = ""
-
-    # ---- Second attempt: JSON fixer ----
-    try:
-        fixer_contents = [
-            f"""You are a strict JSON fixer.
-
-Take the following text (which was supposed to be JSON) and convert it into ONE valid JSON object that matches this SCHEMA:
-
-{schema_hint}
-
-Rules:
-- If data is missing, infer reasonable values.
-- Do NOT add any explanation or text outside the JSON object.
-- Return only the JSON object, nothing else.
-""",
-            raw1 or "EMPTY_TEXT",
-        ]
-        resp2 = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=fixer_contents,
-            generation_config={"temperature": 0.0, "top_p": 0.9},
-        )
-        raw2 = (resp2.text or "").strip()
-        parsed2 = extract_clean_json(raw2)
-        if parsed2 is None:
-            log.error(f"JSON fixer also failed. Raw2 (truncated): {raw2[:500]}")
-        return parsed2
-    except Exception as e:
-        log.error(f"Gemini JSON fixer error: {e}")
-        return None
-
-
-# ============================================================
-# PROMPTS
-# ============================================================
-
 def build_autoscan_prompt(symbol: str, csv_block: str):
-    """
-    Autoscan: volume spike + FRVP + PA
-    Threshold: 82%
-    """
     return [
 f"""
 You are a crypto scalper.
 
 PAIR: {symbol}
 TIMEFRAME: 5m
-DATA: OHLCV CSV (time,open,high,low,close,volume).
+DATA: OHLCV CSV is provided separately.
 
 Focus on:
-- Sudden volume spikes compared to last ~30 candles.
+- Sudden volume spikes vs last ~30 candles.
 - Fixed-range volume profile between recent swing high & low (approx from OHLCV).
-- Price action & candles at these levels (engulfing, hammer, rejection wick).
+- Price action & candles at these key areas (engulfing, hammers, strong rejections).
 - Trend structure (HH/HL vs LH/LL).
 
 Task:
-- Estimate realistic probabilities (0-100), don't force any threshold:
+- Estimate realistic probabilities (0-100):
   upside_prob, downside_prob, flat_prob.
-- Determine dominant_scenario.
+- dominant_scenario is whichever has highest probability.
 
 Trade rules:
-- Let highest_prob = max(ups, downs, flat).
+- highest_prob = max(ups, downs, flat).
 - If highest_prob < 82 → trade_plan = null (NO TRADE).
 - If highest_prob >= 82:
-    - If upside → LONG.
-    - If downside → SHORT.
-    - entry: logical retest or breakout level consistent with volume spike + PA.
-    - stop_loss: beyond clear swing high/low.
-    - take_profits: 1-2 levels, min_rr >= 1.9.
+    - If upside dominant → LONG.
+    - If downside dominant → SHORT.
+    - entry: logical retest or breakout level aligned with volume spike + PA.
+    - stop_loss: beyond recent swing high/low (avoid easy stop hunts).
+    - take_profits: 1-2 levels.
+    - min_rr >= 1.9.
 
-Output only JSON with this structure, no explanation text:
-{AUTOSCAN_SCHEMA_HINT}
+Output:
+Return ONLY ONE JSON object of this form:
+{AUTOSCAN_SCHEMA_DESC}
 """,
 f"CSV_DATA:\n{csv_block}",
 ]
@@ -346,14 +314,14 @@ PAIR: {symbol}
 
 {scope}
 
-From the OHLCV data, estimate natural probabilities (0-100), not forced:
+From the OHLCV data, estimate natural probabilities (0-100) WITHOUT forcing them to 75:
 - upside_prob
 - downside_prob
 - flat_prob
 
 Guidelines:
-- If the structure is messy or conflicting, increase flat_prob.
-- Use trend, S/R, wicks, candle patterns, basic patterns (flags, ranges) and an approximate sense of volume profile.
+- If market is messy or conflicting → increase flat_prob.
+- Use trend, S/R, candle patterns, basic chart patterns, rough volume profile.
 
 Trade rules:
 - highest_prob = max(ups, downs, flat).
@@ -361,12 +329,13 @@ Trade rules:
 - If highest_prob >= 75:
     - If upside dominant → LONG.
     - If downside dominant → SHORT.
-    - entry: logical retest / SR / consolidation break.
+    - entry: logical retest/SR/breakout level.
     - stop_loss: beyond recent key swing.
-    - take_profits: 1-2 levels, min_rr >= 1.9.
+    - take_profits: 1–2 levels, min_rr >= 1.9.
 
-Return ONLY JSON, no extra text:
-{MANUAL_SCHEMA_HINT}
+Output:
+Return ONLY ONE JSON object of this form:
+{MANUAL_SCHEMA_DESC}
 """,
 "".join(sections),
 ]
@@ -463,10 +432,7 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         csv = format_candles_for_ai(candles)
-        result = ask_gemini_with_schema(
-            build_autoscan_prompt(sym, csv),
-            AUTOSCAN_SCHEMA_HINT,
-        )
+        result = gemini_json(build_autoscan_prompt(sym, csv))
         if not result:
             continue
 
@@ -528,7 +494,6 @@ async def manual_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     parts = text.lstrip("/").split()
-
     if not parts:
         return
 
@@ -561,10 +526,7 @@ async def manual_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No data available for this pair.")
             return
 
-    result = ask_gemini_with_schema(
-        build_manual_prompt(symbol, tf_blocks, requested_tf_label),
-        MANUAL_SCHEMA_HINT,
-    )
+    result = gemini_json(build_manual_prompt(symbol, tf_blocks, requested_tf_label))
     if not result:
         await update.message.reply_text("❌ Gemini could not produce valid JSON. Try again.")
         return
@@ -635,8 +597,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 Auto-scan started.\n\n"
         "- Every 5 minutes: scan MEXC USDT futures with 24h volume ≥ 50M.\n"
-        "- Logic: volume spike + FRVP style + price action.\n"
-        "- Signals only if probability ≥ 82%.\n"
+        "- Logic: volume spike + FRVP-style + price action.\n"
+        "- Signals only if probability ≥ 82% and RR ≥ 1.9.\n"
         f"- Auto-trade BingX: {'ON ✅' if BINGX_ENABLE_AUTOTRADE else 'OFF ❌'}"
     )
 
@@ -665,9 +627,9 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📈 Gemini + MEXC Futures Bot (Balanced Mode)\n\n"
+        "📈 Gemini + MEXC Futures Bot (Balanced JSON Mode)\n\n"
         "Auto-scan:\n"
-        "- /start → start autoscan (5m, volume spike + FRVP style)\n"
+        "- /start → start autoscan (5m, volume spike + FRVP-style)\n"
         "- /stop → stop autoscan\n\n"
         "Manual analysis:\n"
         "- `/btcusdt` → multi-TF (5m, 1h, 4h, 1D)\n"
@@ -700,3 +662,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

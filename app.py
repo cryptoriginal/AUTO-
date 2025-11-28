@@ -1,9 +1,9 @@
 # ================================
-# GEMINI + MEXC CRYPTO ANALYSIS BOT (Balanced, JSON-Stable)
+# OPENROUTER (CLAUDE 3.1) + MEXC CRYPTO BOT
 # - Manual analysis (/btcusdt, /suiusdt 4h, etc.)
-# - Autoscan (5m, volume spike + FRVP-style + PA, 7x auto-trade optional)
-# - Autoscalp (/autoscalp) – fast scalps with 10x auto-trade + TP/SL tracking
-# - Uses response_mime_type="application/json" for stable parsing
+# - Autoscan (5m, volume spike + FRVP-style + PA, optional 7x auto-trade)
+# - Autoscalp (/autoscalp) – fast scalps with 10x auto-trade + TP/SL/trailing
+# - Uses OpenRouter /chat/completions with response_format={"type":"json_object"}
 # ================================
 
 import os
@@ -15,8 +15,6 @@ import logging
 from datetime import datetime, timezone
 
 import requests
-from google import genai
-from google.genai import types
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -34,28 +32,30 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
 
-GEMINI_KEY = (
-    os.getenv("GEMINI_API_KEY", "").strip()
-    or os.getenv("GOOGLE_API_KEY", "").strip()
-)
-if not GEMINI_KEY:
-    raise RuntimeError("GEMINI_API_KEY / GOOGLE_API_KEY missing")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY missing")
 
-gemini_client = genai.Client(api_key=GEMINI_KEY)
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL", "openrouter/anthropic/claude-3.1-sonnet"
+).strip()
+OPENROUTER_BASE_URL = os.getenv(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+).strip()
 
 MEXC_URL = "https://contract.mexc.com"
 
 # Autoscan config
 SCAN_INTERVAL = 300      # 5m
-COOLDOWN = 600           # 10m cooldown after signals
+COOLDOWN = 600           # 10m cooldown between batches
 MAX_COINS = 20
 AUTOSCAN = {}
 
 # Autoscalp config
-AUTOSCALP_INTERVAL = 60  # 1 minute loop (scan + manage open scalps)
+AUTOSCALP_INTERVAL = 60  # 1m loop
 AUTOSCALP_JOBS = {}      # chat_id -> job
 AUTOSCALP_POSITIONS = {} # chat_id -> list of open scalps
-BOT_PNL = {}             # chat_id -> cumulative PnL in USDT
+BOT_PNL = {}             # chat_id -> cumulative PnL (USDT)
 
 # Candles per TF (balanced)
 MAX_CANDLES = 60
@@ -86,8 +86,7 @@ BINGX_LEVERAGE_AUTOSCAN = 7    # autoscan leverage
 BINGX_LEVERAGE_AUTOSCALP = 10  # autoscalp leverage
 
 # Trailing config for autoscalp
-TRAIL_ACTIVATION_PCT = 0.5  # when +0.5% in favor, move SL to BE
-TRAIL_STEP_PCT = 0.0        # (kept simple: just trail to BE once)
+TRAIL_ACTIVATION_PCT = 0.5  # when move in favor >= 0.5%, move SL to BE
 
 # ============================================================
 # LOGGING
@@ -180,15 +179,10 @@ def get_high_volume_coins(min_vol=50_000_000):
 
 
 # ============================================================
-# GEMINI JSON CALL (FORCED JSON OUTPUT)
+# OPENROUTER CHAT (JSON)
 # ============================================================
 
-def parse_json_text(text: str):
-    """
-    Handle both:
-      - pure JSON: {"a":1}
-      - JSON-as-string: "{\"a\":1}"
-    """
+def _parse_json_text(text: str):
     if not text:
         return None
     try:
@@ -204,28 +198,36 @@ def parse_json_text(text: str):
         return None
 
 
-def gemini_json(contents):
+def openrouter_json(system_prompt: str, user_prompt: str):
     """
-    Call Gemini with response_mime_type='application/json'
-    So resp.text should always be JSON or JSON string.
+    Call OpenRouter /chat/completions with response_format json_object.
     """
     try:
-        resp = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.15,
-                top_p=0.8,
-            ),
-        )
-        txt = (resp.text or "").strip()
-        obj = parse_json_text(txt)
-        if obj is None:
-            log.error(f"Gemini JSON parse failed. Raw (truncated): {txt[:500]}")
-        return obj
+        url = f"{OPENROUTER_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "X-Title": "MEXC-BingX-TG-Bot",
+        }
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "top_p": 0.85,
+            "response_format": {"type": "json_object"},
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=40)
+        data = r.json()
+        if "choices" not in data or not data["choices"]:
+            log.error(f"OpenRouter bad response: {data}")
+            return None
+        content = data["choices"][0]["message"]["content"]
+        return _parse_json_text(content)
     except Exception as e:
-        log.error(f"Gemini API error: {e}")
+        log.error(f"OpenRouter request error: {e}")
         return None
 
 
@@ -238,9 +240,9 @@ AUTOSCAN_SCHEMA_DESC = """
   "upside_prob": int,
   "downside_prob": int,
   "flat_prob": int,
-  "dominant_scenario": "upside"|"downside"|"flat",
+  "dominant_scenario": "upside" | "downside" | "flat",
   "trade_plan": null | {
-     "direction": "long"|"short",
+     "direction": "long" | "short",
      "entry": float,
      "stop_loss": float,
      "take_profits": [float, ...],
@@ -254,9 +256,9 @@ MANUAL_SCHEMA_DESC = """
   "upside_prob": int,
   "downside_prob": int,
   "flat_prob": int,
-  "dominant_scenario": "upside"|"downside"|"flat",
+  "dominant_scenario": "upside" | "downside" | "flat",
   "trade_plan": null | {
-     "direction": "long"|"short",
+     "direction": "long" | "short",
      "entry": float,
      "stop_loss": float,
      "take_profits": [float, ...],
@@ -269,7 +271,7 @@ MANUAL_SCHEMA_DESC = """
 AUTOSCALP_SCHEMA_DESC = """
 {
   "take_trade": bool,
-  "direction": "long"|"short",
+  "direction": "long" | "short",
   "probability": int,
   "entry": float,
   "stop_loss": float,
@@ -278,138 +280,128 @@ AUTOSCALP_SCHEMA_DESC = """
 """
 
 
-def build_autoscan_prompt(symbol: str, csv_block: str):
-    return [
-f"""
-You are a crypto scalper.
+def build_autoscan_prompts(symbol: str, csv_block: str):
+    system = f"""
+You are a professional crypto futures trader.
 
-PAIR: {symbol}
-TIMEFRAME: 5m
-DATA: OHLCV CSV is provided separately.
+Your job is to analyse 5m MEXC futures data and output a SINGLE JSON object
+with this exact structure:
 
-Focus on:
-- Sudden volume spikes vs last ~30 candles.
-- Fixed-range volume profile between recent swing high & low (approx from OHLCV).
-- Price action & candles at these key areas (engulfing, hammers, strong rejections).
-- Trend structure (HH/HL vs LH/LL).
-
-Task:
-- Estimate realistic probabilities (0-100):
-  upside_prob, downside_prob, flat_prob.
-- dominant_scenario is whichever has highest probability.
-
-Trade rules:
-- highest_prob = max(ups, downs, flat).
-- If highest_prob < 82 → trade_plan = null (NO TRADE).
-- If highest_prob >= 82:
-    - If upside dominant → LONG.
-    - If downside dominant → SHORT.
-    - entry: logical retest or breakout level aligned with volume spike + PA.
-    - stop_loss: beyond recent swing high/low (avoid easy stop hunts).
-    - take_profits: 1-2 levels.
-    - min_rr >= 1.9.
-
-Output:
-Return ONLY ONE JSON object of this form:
 {AUTOSCAN_SCHEMA_DESC}
-""",
-f"CSV_DATA:\n{csv_block}",
-]
+
+Rules:
+- Use the CSV OHLCV data I provide (time,open,high,low,close,volume).
+- Focus on:
+  - Sudden volume spikes vs last ~30 candles.
+  - Rough fixed-range volume profile between recent swing high & low.
+  - Price action and candles at these key areas.
+  - Trend structure (HH/HL vs LH/LL).
+
+- Compute realistic probabilities (0-100) for upside, downside, flat.
+- dominant_scenario = the one with highest probability.
+- highest_prob = max(ups, downs, flat).
+
+- If highest_prob < 82 → trade_plan MUST be null.
+- If highest_prob >= 82:
+    * If upside dominant → LONG.
+    * If downside dominant → SHORT.
+    * entry: logical retest / level supported by structure + volume.
+    * stop_loss: beyond recent swing high/low (avoid easy stop hunts).
+    * take_profits: 1-2 PTs.
+    * min_rr >= 1.9.
+
+Return ONLY valid JSON, no explanation text.
+"""
+    user = f"PAIR: {symbol}\nTIMEFRAME: 5m\n\nCSV OHLCV DATA:\n{csv_block}"
+    return system, user
 
 
-def build_manual_prompt(symbol: str, tf_blocks: dict, requested_tf: str | None):
+def build_manual_prompts(symbol: str, tf_blocks: dict, requested_tf: str | None):
     scope = (
         f"Focus ONLY on timeframe {requested_tf}."
         if requested_tf
-        else "Use multiple timeframes: higher TF for bias, lower TF for entry timing."
+        else "Use 5m/1h/4h/1D together: higher TF for bias, lower TF for entry timing."
     )
-
     sections = []
     for label, csv in tf_blocks.items():
-        sections.append(f"\n=== {label} ===\n{csv}")
+        sections.append(f"\n=== TF {label} ===\n{csv}")
+    all_csv = "".join(sections)
 
-    return [
-f"""
+    system = f"""
 You are a world-class crypto futures trader and risk manager.
+
+You must output a SINGLE JSON object with this structure:
+
+{MANUAL_SCHEMA_DESC}
 
 PAIR: {symbol}
 
 {scope}
 
-From the OHLCV data, estimate natural probabilities (0-100) WITHOUT forcing them to 75:
-- upside_prob
-- downside_prob
-- flat_prob
-
-Guidelines:
-- If market is messy or conflicting → increase flat_prob.
-- Use trend, S/R, candle patterns, basic chart patterns, rough volume profile.
+From the OHLCV data:
+- Estimate natural probabilities (0-100) for upside, downside, flat.
+- Do NOT force them to 75. If the market is messy, increase flat_prob.
+- Use trend, support/resistance, wicks, candle patterns, and rough volume profile.
 
 Trade rules:
 - highest_prob = max(ups, downs, flat).
-- If highest_prob < 75 → trade_plan = null (avoid trade).
+- If highest_prob < 75 → trade_plan MUST be null (avoid trade).
 - If highest_prob >= 75:
-    - If upside dominant → LONG.
-    - If downside dominant → SHORT.
-    - entry: logical retest/SR/breakout level.
-    - stop_loss: beyond recent key swing.
-    - take_profits: 1–2 levels, min_rr >= 1.9.
+    * If upside dominant → LONG.
+    * If downside dominant → SHORT.
+    * entry: logical retest / SR / breakout level.
+    * stop_loss: beyond recent clear swing.
+    * take_profits: 1–2 levels, min_rr >= 1.9.
 
-Output:
-Return ONLY ONE JSON object of this form:
-{MANUAL_SCHEMA_DESC}
-""",
-"".join(sections),
-]
+summary: 1–3 sentences max, very short.
+
+Return ONLY JSON, no extra text.
+"""
+    user = f"PAIR: {symbol}\n\nMULTI-TIMEFRAME CSV DATA:\n{all_csv}"
+    return system, user
 
 
-def build_autoscalp_prompt(symbol: str, csv_block: str):
-    """
-    Scalping prompt:
-    - 1m or 5m data
-    - small targets, tight SL
-    - separate from autoscan logic
-    """
-    return [
-f"""
+def build_autoscalp_prompts(symbol: str, csv_block: str):
+    system = f"""
 You are a high-frequency crypto scalper.
 
+You must output a SINGLE JSON object with this structure:
+
+{AUTOSCALP_SCHEMA_DESC}
+
 PAIR: {symbol}
-TIMEFRAME: 1m
-DATA: 1m OHLCV CSV is provided separately.
+TIMEFRAME: 1m.
 
 Goal:
 - Catch short intraday moves with tight SL and TP.
-- Capture even 0.5–1.5% moves is acceptable if reward > risk.
+- Capturing 0.7–1.5% moves is acceptable if reward > risk.
 
-Rules:
+Logic:
 - Look for:
   - sudden volume increase vs recent candles,
   - micro breakouts / breakdowns,
-  - strong candle confirmations (engulfing, hammer, long wick rejections),
+  - strong candle confirmations (engulfing, hammer, long wicks),
   - very near support/resistance flips.
 
-Output logic:
-- First, decide if there is a clean scalp opportunity RIGHT NOW.
-- If not → take_trade = false (ignore others, no trade).
-- If yes → take_trade = true and fill the rest.
+- Decide if there is a clean scalp RIGHT NOW.
+- If not, set take_trade = false and ignore the rest.
 
-- probability = your confidence (0–100) in this scalp working.
-- direction = "long" or "short".
-- entry: approximate fair entry near current price (limit style).
-- stop_loss: tight, beyond obvious micro swing (but not too tight).
-- take_profit: realistic short-term scalp target (around 0.7–1.5% away).
+- If yes:
+  - take_trade = true
+  - direction = "long" or "short"
+  - probability = your confidence (0–100)
+  - entry = logical fair entry near current price
+  - stop_loss = tight SL beyond micro swing
+  - take_profit = realistic scalp target (around 0.7–1.5% away)
 
-Soft rules:
+Soft rule:
 - Only set take_trade=true if probability >= 75.
-- For this bot, code will still filter and only take trades if probability >= 80.
+The caller will only execute if probability >= 80.
 
-Output:
-Return ONLY ONE JSON object of this form:
-{AUTOSCALP_SCHEMA_DESC}
-""",
-f"CSV_DATA:\n{csv_block}",
-]
+Return ONLY JSON, no extra text.
+"""
+    user = f"PAIR: {symbol}\nTIMEFRAME: 1m\n\nCSV OHLCV DATA:\n{csv_block}"
+    return system, user
 
 
 # ============================================================
@@ -483,9 +475,6 @@ def bingx_place_market(symbol: str, direction: str, leverage: float, cost_usdt: 
 
 
 def bingx_close_market(symbol: str, original_direction: str, qty: float):
-    """
-    Close position by sending opposite side market.
-    """
     if not (BINGX_API_KEY and BINGX_API_SECRET):
         return {"success": False, "raw": None}
 
@@ -512,7 +501,7 @@ def bingx_close_market(symbol: str, original_direction: str, qty: float):
 
 
 # ============================================================
-# AUTOSCAN JOB (same as before)
+# AUTOSCAN JOB
 # ============================================================
 
 async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -537,7 +526,8 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         csv = format_candles_for_ai(candles)
-        result = gemini_json(build_autoscan_prompt(sym, csv))
+        system, user = build_autoscan_prompts(sym, csv)
+        result = openrouter_json(system, user)
         if not result:
             continue
 
@@ -565,7 +555,9 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
         trade_info = ""
         if BINGX_ENABLE_AUTOTRADE:
             bx_sym = mexc_to_bingx_symbol(sym)
-            resp = bingx_place_market(bx_sym, direction, BINGX_LEVERAGE_AUTOSCAN, BINGX_TRADE_COST_USDT)
+            resp = bingx_place_market(
+                bx_sym, direction, BINGX_LEVERAGE_AUTOSCAN, BINGX_TRADE_COST_USDT
+            )
             if resp["success"]:
                 trade_info = "\nAuto-trade: ✅ BingX MARKET 7x order placed."
             else:
@@ -594,20 +586,14 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Runs every AUTOSCALP_INTERVAL seconds:
-    - Manages open scalps (check TP/SL/trailing)
-    - Scans for new scalps if we have capacity
-    """
     job_data = context.job.data
     chat_id = job_data["chat"]
 
-    # Init state for this chat
     positions = AUTOSCALP_POSITIONS.setdefault(chat_id, [])
     bot_pnl = BOT_PNL.setdefault(chat_id, 0.0)
 
     # 1) Manage existing scalps
-    for pos in positions[:]:  # copy to allow remove
+    for pos in positions[:]:
         symbol_bx = pos["symbol_bx"]
         direction = pos["direction"]
         qty = pos["qty"]
@@ -625,18 +611,15 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
         exit_price = None
 
         if direction == "long":
-            # activate trailing
             if not trail_active and price >= entry * (1 + TRAIL_ACTIVATION_PCT / 100):
                 trail_active = True
-                trail_sl = entry  # move SL to BE
+                trail_sl = entry
                 pos["trail_active"] = True
                 pos["trail_sl"] = trail_sl
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🔁 Trailing activated on {symbol_bx} LONG. SL moved to breakeven {entry:.6f}",
+                    text=f"🔁 Trailing activated on {symbol_bx} LONG. SL moved to BE {entry:.6f}",
                 )
-
-            # Check TP / SL / trailing SL
             if price >= tp:
                 hit = "TP"
                 exit_price = tp
@@ -654,9 +637,8 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
                 pos["trail_sl"] = trail_sl
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🔁 Trailing activated on {symbol_bx} SHORT. SL moved to breakeven {entry:.6f}",
+                    text=f"🔁 Trailing activated on {symbol_bx} SHORT. SL moved to BE {entry:.6f}",
                 )
-
             if price <= tp:
                 hit = "TP"
                 exit_price = tp
@@ -668,7 +650,6 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
                 exit_price = price
 
         if hit:
-            # Close position on BingX
             close_resp = bingx_close_market(symbol_bx, direction, qty)
             if not close_resp["success"]:
                 await context.bot.send_message(
@@ -677,7 +658,6 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
                 )
                 continue
 
-            # Compute PnL approx
             if direction == "long":
                 pnl = (exit_price - entry) * qty
             else:
@@ -697,10 +677,9 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
                     f"Bot cumulative PnL: {bot_pnl:.2f} USDT"
                 ),
             )
-            # Remove position from list
             positions.remove(pos)
 
-    # 2) Scan for new scalps (limit open positions per chat, e.g. 3)
+    # 2) Look for new scalps if we have capacity
     MAX_OPEN_SCALPS = 3
     if len(positions) >= MAX_OPEN_SCALPS:
         return
@@ -718,7 +697,8 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         csv = format_candles_for_ai(candles)
-        result = gemini_json(build_autoscalp_prompt(sym, csv))
+        system, user = build_autoscalp_prompts(sym, csv)
+        result = openrouter_json(system, user)
         if not result:
             continue
 
@@ -734,9 +714,10 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
         if direction not in ("long", "short") or entry_ai is None or sl_ai is None or tp_ai is None:
             continue
 
-        # Open trade on BingX at market with 10x
         bx_sym = mexc_to_bingx_symbol(sym)
-        open_resp = bingx_place_market(bx_sym, direction, BINGX_LEVERAGE_AUTOSCALP, BINGX_TRADE_COST_USDT)
+        open_resp = bingx_place_market(
+            bx_sym, direction, BINGX_LEVERAGE_AUTOSCALP, BINGX_TRADE_COST_USDT
+        )
         if not open_resp["success"]:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -747,7 +728,6 @@ async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
         qty = open_resp["qty"]
         entry_fill = open_resp["entry_price"]
 
-        # Set initial trail params
         position = {
             "symbol_mexc": sym,
             "symbol_bx": bx_sym,
@@ -818,9 +798,10 @@ async def manual_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No data available for this pair.")
             return
 
-    result = gemini_json(build_manual_prompt(symbol, tf_blocks, requested_tf_label))
+    system, user = build_manual_prompts(symbol, tf_blocks, requested_tf_label)
+    result = openrouter_json(system, user)
     if not result:
-        await update.message.reply_text("❌ Gemini could not produce valid JSON. Try again.")
+        await update.message.reply_text("❌ OpenRouter could not produce valid JSON. Try again.")
         return
 
     up = int(result.get("upside_prob", 0))
@@ -918,10 +899,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_autoscalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /autoscalp        -> start autoscalp
-    /autoscalp stop   -> stop autoscalp
-    """
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip().lower()
 
@@ -929,17 +906,18 @@ async def cmd_autoscalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job = AUTOSCALP_JOBS.pop(chat_id, None)
         if job:
             job.schedule_removal()
-            await update.message.reply_text("🛑 Autoscalp stopped. Existing scalps will still be managed until closed.")
+            await update.message.reply_text(
+                "🛑 Autoscalp stopped. Existing scalps will still be managed until closed."
+            )
         else:
             await update.message.reply_text("Autoscalp is not running for this chat.")
         return
 
-    # Start autoscalp
     await update.message.reply_text(
         "⚡ Autoscalp started.\n\n"
         "- Scans high-volume coins (≥ 50M 24h) on 1m timeframe.\n"
         "- Looks for scalp setups with tight SL & TP.\n"
-        "- Auto-trades on BingX at 10x leverage with virtual trailing to breakeven.\n"
+        "- Auto-trades on BingX at 10x leverage with trailing to breakeven.\n"
         "- Sends open/close + PnL updates here.\n\n"
         "Use `/autoscalp stop` to stop scalping."
     )
@@ -959,21 +937,21 @@ async def cmd_autoscalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📈 Gemini + MEXC Futures Bot (Balanced JSON Mode)\n\n"
+        "📈 OpenRouter (Claude 3.1) + MEXC Futures Bot\n\n"
         "Auto-scan (swing-ish signals):\n"
         "- /start → start autoscan (5m, volume spike + FRVP-style)\n"
         "- /stop → stop autoscan\n\n"
-        "Autoscalp (fast scalps + auto-trade 10x):\n"
+        "Autoscalp (fast scalps + 10x auto-trade):\n"
         "- /autoscalp → start autoscalp\n"
         "- /autoscalp stop → stop autoscalp\n\n"
         "Manual analysis:\n"
         "- `/btcusdt` → multi-TF (5m, 1h, 4h, 1D)\n"
         "- `/suiusdt 4h` → single TF\n"
         "- `/ethusdt 1h` → single TF\n\n"
-        "I only give entry/SL/TP in manual analysis if highest probability ≥ 75%.\n"
-        "Below 75%: I’ll tell you to avoid the trade.\n\n"
+        "Entry/SL/TP only shown when highest probability ≥ 75%.\n"
+        "Below 75%: I tell you to avoid the trade.\n\n"
         f"Auto-trade (BingX): {'ENABLED' if BINGX_ENABLE_AUTOTRADE else 'DISABLED'}\n"
-        "⚠ Futures trading is very risky. Use at your own risk, preferably start with tiny size or paper trading.",
+        "⚠ Futures are high risk. Use small size and test carefully.",
         parse_mode="Markdown",
     )
 

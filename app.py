@@ -1,8 +1,8 @@
 # ================================
 # GEMINI + MEXC CRYPTO ANALYSIS BOT (Balanced, JSON-Stable)
 # - Manual analysis (/btcusdt, /suiusdt 4h, etc.)
-# - Autoscan (5m, volume spike + FRVP-style + PA)
-# - Optional BingX auto-trade (MARKET, 7x)
+# - Autoscan (5m, volume spike + FRVP-style + PA, 7x auto-trade optional)
+# - Autoscalp (/autoscalp) – fast scalps with 10x auto-trade + TP/SL tracking
 # - Uses response_mime_type="application/json" for stable parsing
 # ================================
 
@@ -51,6 +51,12 @@ COOLDOWN = 600           # 10m cooldown after signals
 MAX_COINS = 20
 AUTOSCAN = {}
 
+# Autoscalp config
+AUTOSCALP_INTERVAL = 60  # 1 minute loop (scan + manage open scalps)
+AUTOSCALP_JOBS = {}      # chat_id -> job
+AUTOSCALP_POSITIONS = {} # chat_id -> list of open scalps
+BOT_PNL = {}             # chat_id -> cumulative PnL in USDT
+
 # Candles per TF (balanced)
 MAX_CANDLES = 60
 
@@ -76,7 +82,12 @@ BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
 BINGX_ENABLE_AUTOTRADE = os.getenv("BINGX_ENABLE_AUTOTRADE", "false").lower() == "true"
 BINGX_TRADE_COST_USDT = float(os.getenv("BINGX_TRADE_COST_USDT", "10"))
 BINGX_BASE_URL = "https://open-api.bingx.com"
-BINGX_LEVERAGE = 7
+BINGX_LEVERAGE_AUTOSCAN = 7    # autoscan leverage
+BINGX_LEVERAGE_AUTOSCALP = 10  # autoscalp leverage
+
+# Trailing config for autoscalp
+TRAIL_ACTIVATION_PCT = 0.5  # when +0.5% in favor, move SL to BE
+TRAIL_STEP_PCT = 0.0        # (kept simple: just trail to BE once)
 
 # ============================================================
 # LOGGING
@@ -255,6 +266,17 @@ MANUAL_SCHEMA_DESC = """
 }
 """
 
+AUTOSCALP_SCHEMA_DESC = """
+{
+  "take_trade": bool,
+  "direction": "long"|"short",
+  "probability": int,
+  "entry": float,
+  "stop_loss": float,
+  "take_profit": float
+}
+"""
+
 
 def build_autoscan_prompt(symbol: str, csv_block: str):
     return [
@@ -341,6 +363,55 @@ Return ONLY ONE JSON object of this form:
 ]
 
 
+def build_autoscalp_prompt(symbol: str, csv_block: str):
+    """
+    Scalping prompt:
+    - 1m or 5m data
+    - small targets, tight SL
+    - separate from autoscan logic
+    """
+    return [
+f"""
+You are a high-frequency crypto scalper.
+
+PAIR: {symbol}
+TIMEFRAME: 1m
+DATA: 1m OHLCV CSV is provided separately.
+
+Goal:
+- Catch short intraday moves with tight SL and TP.
+- Capture even 0.5–1.5% moves is acceptable if reward > risk.
+
+Rules:
+- Look for:
+  - sudden volume increase vs recent candles,
+  - micro breakouts / breakdowns,
+  - strong candle confirmations (engulfing, hammer, long wick rejections),
+  - very near support/resistance flips.
+
+Output logic:
+- First, decide if there is a clean scalp opportunity RIGHT NOW.
+- If not → take_trade = false (ignore others, no trade).
+- If yes → take_trade = true and fill the rest.
+
+- probability = your confidence (0–100) in this scalp working.
+- direction = "long" or "short".
+- entry: approximate fair entry near current price (limit style).
+- stop_loss: tight, beyond obvious micro swing (but not too tight).
+- take_profit: realistic short-term scalp target (around 0.7–1.5% away).
+
+Soft rules:
+- Only set take_trade=true if probability >= 75.
+- For this bot, code will still filter and only take trades if probability >= 80.
+
+Output:
+Return ONLY ONE JSON object of this form:
+{AUTOSCALP_SCHEMA_DESC}
+""",
+f"CSV_DATA:\n{csv_block}",
+]
+
+
 # ============================================================
 # BINGX HELPERS
 # ============================================================
@@ -369,17 +440,21 @@ def bingx_get_price(symbol: str) -> float | None:
     return None
 
 
-def bingx_place_market(symbol: str, direction: str):
+def bingx_place_market(symbol: str, direction: str, leverage: float, cost_usdt: float):
+    """
+    Open MARKET position on BingX.
+    Returns dict with success, qty, entry_price.
+    """
     if not (BINGX_API_KEY and BINGX_API_SECRET):
         log.info("BingX keys missing, skipping auto-trade.")
-        return None
+        return {"success": False, "qty": 0.0, "entry_price": None, "raw": None}
 
     price = bingx_get_price(symbol)
     if not price or price <= 0:
         log.warning(f"No BingX price for {symbol}")
-        return None
+        return {"success": False, "qty": 0.0, "entry_price": None, "raw": None}
 
-    notional = BINGX_TRADE_COST_USDT * BINGX_LEVERAGE
+    notional = cost_usdt * leverage
     qty = notional / price
     qty = float(f"{qty:.6f}")
 
@@ -399,15 +474,45 @@ def bingx_place_market(symbol: str, direction: str):
     headers = {"X-BX-APIKEY": BINGX_API_KEY}
     try:
         r = requests.post(url, headers=headers, timeout=10).json()
-        log.info(f"BingX order response: {r}")
-        return r
+        log.info(f"BingX open order response: {r}")
+        success = bool(r.get("success"))
+        return {"success": success, "qty": qty, "entry_price": price, "raw": r}
     except Exception as e:
         log.error(f"bingx_place_market error: {e}")
-        return None
+        return {"success": False, "qty": 0.0, "entry_price": None, "raw": None}
+
+
+def bingx_close_market(symbol: str, original_direction: str, qty: float):
+    """
+    Close position by sending opposite side market.
+    """
+    if not (BINGX_API_KEY and BINGX_API_SECRET):
+        return {"success": False, "raw": None}
+
+    side = "SELL" if original_direction == "long" else "BUY"
+    pos_side = "LONG" if original_direction == "long" else "SHORT"
+
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": pos_side,
+        "type": "MARKET",
+        "quantity": float(f"{qty:.6f}"),
+        "timestamp": int(time.time() * 1000),
+    }
+    url = f"{BINGX_BASE_URL}/openApi/swap/v2/trade/order?{bingx_sign(params)}"
+    headers = {"X-BX-APIKEY": BINGX_API_KEY}
+    try:
+        r = requests.post(url, headers=headers, timeout=10).json()
+        log.info(f"BingX close order response: {r}")
+        return {"success": bool(r.get("success")), "raw": r}
+    except Exception as e:
+        log.error(f"bingx_close_market error: {e}")
+        return {"success": False, "raw": None}
 
 
 # ============================================================
-# AUTOSCAN JOB
+# AUTOSCAN JOB (same as before)
 # ============================================================
 
 async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -460,8 +565,8 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
         trade_info = ""
         if BINGX_ENABLE_AUTOTRADE:
             bx_sym = mexc_to_bingx_symbol(sym)
-            resp = bingx_place_market(bx_sym, direction)
-            if resp and resp.get("success"):
+            resp = bingx_place_market(bx_sym, direction, BINGX_LEVERAGE_AUTOSCAN, BINGX_TRADE_COST_USDT)
+            if resp["success"]:
                 trade_info = "\nAuto-trade: ✅ BingX MARKET 7x order placed."
             else:
                 trade_info = "\nAuto-trade: ❌ Failed (check logs/API)."
@@ -485,6 +590,193 @@ async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# AUTOSCALP JOB
+# ============================================================
+
+async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs every AUTOSCALP_INTERVAL seconds:
+    - Manages open scalps (check TP/SL/trailing)
+    - Scans for new scalps if we have capacity
+    """
+    job_data = context.job.data
+    chat_id = job_data["chat"]
+
+    # Init state for this chat
+    positions = AUTOSCALP_POSITIONS.setdefault(chat_id, [])
+    bot_pnl = BOT_PNL.setdefault(chat_id, 0.0)
+
+    # 1) Manage existing scalps
+    for pos in positions[:]:  # copy to allow remove
+        symbol_bx = pos["symbol_bx"]
+        direction = pos["direction"]
+        qty = pos["qty"]
+        entry = pos["entry"]
+        sl = pos["sl"]
+        tp = pos["tp"]
+        trail_active = pos["trail_active"]
+        trail_sl = pos["trail_sl"]
+
+        price = bingx_get_price(symbol_bx)
+        if not price:
+            continue
+
+        hit = None
+        exit_price = None
+
+        if direction == "long":
+            # activate trailing
+            if not trail_active and price >= entry * (1 + TRAIL_ACTIVATION_PCT / 100):
+                trail_active = True
+                trail_sl = entry  # move SL to BE
+                pos["trail_active"] = True
+                pos["trail_sl"] = trail_sl
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔁 Trailing activated on {symbol_bx} LONG. SL moved to breakeven {entry:.6f}",
+                )
+
+            # Check TP / SL / trailing SL
+            if price >= tp:
+                hit = "TP"
+                exit_price = tp
+            elif price <= sl and not trail_active:
+                hit = "SL"
+                exit_price = sl
+            elif trail_active and price <= trail_sl:
+                hit = "TRAIL_SL"
+                exit_price = price
+        else:  # short
+            if not trail_active and price <= entry * (1 - TRAIL_ACTIVATION_PCT / 100):
+                trail_active = True
+                trail_sl = entry
+                pos["trail_active"] = True
+                pos["trail_sl"] = trail_sl
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔁 Trailing activated on {symbol_bx} SHORT. SL moved to breakeven {entry:.6f}",
+                )
+
+            if price <= tp:
+                hit = "TP"
+                exit_price = tp
+            elif price >= sl and not trail_active:
+                hit = "SL"
+                exit_price = sl
+            elif trail_active and price >= trail_sl:
+                hit = "TRAIL_SL"
+                exit_price = price
+
+        if hit:
+            # Close position on BingX
+            close_resp = bingx_close_market(symbol_bx, direction, qty)
+            if not close_resp["success"]:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Tried to close {symbol_bx} {direction.upper()} on {hit}, but close failed. Check exchange.",
+                )
+                continue
+
+            # Compute PnL approx
+            if direction == "long":
+                pnl = (exit_price - entry) * qty
+            else:
+                pnl = (entry - exit_price) * qty
+            pnl_pct = (pnl / BINGX_TRADE_COST_USDT) * 100.0
+            bot_pnl += pnl
+            BOT_PNL[chat_id] = bot_pnl
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ Autoscalp {hit} on {symbol_bx} {direction.upper()}\n"
+                    f"Entry: {entry:.6f}\n"
+                    f"Exit: {exit_price:.6f}\n"
+                    f"Qty: {qty:.6f}\n"
+                    f"PnL: {pnl:.2f} USDT ({pnl_pct:.2f}%)\n"
+                    f"Bot cumulative PnL: {bot_pnl:.2f} USDT"
+                ),
+            )
+            # Remove position from list
+            positions.remove(pos)
+
+    # 2) Scan for new scalps (limit open positions per chat, e.g. 3)
+    MAX_OPEN_SCALPS = 3
+    if len(positions) >= MAX_OPEN_SCALPS:
+        return
+
+    symbols = get_high_volume_coins()
+    if not symbols:
+        return
+
+    for sym in symbols:
+        if len(positions) >= MAX_OPEN_SCALPS:
+            break
+
+        candles = get_mexc_candles(sym, "Min1", MAX_CANDLES)
+        if len(candles) < 20:
+            continue
+
+        csv = format_candles_for_ai(candles)
+        result = gemini_json(build_autoscalp_prompt(sym, csv))
+        if not result:
+            continue
+
+        take_trade = bool(result.get("take_trade", False))
+        direction = result.get("direction")
+        prob = int(result.get("probability", 0))
+        entry_ai = result.get("entry")
+        sl_ai = result.get("stop_loss")
+        tp_ai = result.get("take_profit")
+
+        if not take_trade or prob < 80:
+            continue
+        if direction not in ("long", "short") or entry_ai is None or sl_ai is None or tp_ai is None:
+            continue
+
+        # Open trade on BingX at market with 10x
+        bx_sym = mexc_to_bingx_symbol(sym)
+        open_resp = bingx_place_market(bx_sym, direction, BINGX_LEVERAGE_AUTOSCALP, BINGX_TRADE_COST_USDT)
+        if not open_resp["success"]:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Autoscalp: BingX order failed for {bx_sym} {direction.upper()}.",
+            )
+            continue
+
+        qty = open_resp["qty"]
+        entry_fill = open_resp["entry_price"]
+
+        # Set initial trail params
+        position = {
+            "symbol_mexc": sym,
+            "symbol_bx": bx_sym,
+            "direction": direction,
+            "entry": entry_fill,
+            "sl": float(sl_ai),
+            "tp": float(tp_ai),
+            "qty": qty,
+            "trail_active": False,
+            "trail_sl": float(sl_ai),
+            "opened_at": time.time(),
+        }
+        positions.append(position)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚡ AUTOSCALP OPENED\n"
+                f"{bx_sym} {direction.upper()} (10x)\n"
+                f"AI Prob: {prob}%\n"
+                f"Entry (fill): {entry_fill:.6f}\n"
+                f"SL: {float(sl_ai):.6f}\n"
+                f"TP: {float(tp_ai):.6f}\n"
+                f"Trailing: BE after +{TRAIL_ACTIVATION_PCT:.2f}% move"
+            ),
+        )
+
+
+# ============================================================
 # MANUAL ANALYSIS
 # ============================================================
 
@@ -498,7 +790,7 @@ async def manual_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cmd = parts[0].lower()
-    if cmd in ("start", "stop", "help"):
+    if cmd in ("start", "stop", "help", "autoscalp"):
         return
 
     tf_arg = parts[1].lower() if len(parts) > 1 else None
@@ -599,7 +891,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- Every 5 minutes: scan MEXC USDT futures with 24h volume ≥ 50M.\n"
         "- Logic: volume spike + FRVP-style + price action.\n"
         "- Signals only if probability ≥ 82% and RR ≥ 1.9.\n"
-        f"- Auto-trade BingX: {'ON ✅' if BINGX_ENABLE_AUTOTRADE else 'OFF ❌'}"
+        f"- Auto-trade BingX (autoscan): {'ON ✅' if BINGX_ENABLE_AUTOTRADE else 'OFF ❌'}"
     )
 
     if chat_id in AUTOSCAN:
@@ -625,19 +917,63 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Auto-scan is not running for this chat.")
 
 
+async def cmd_autoscalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /autoscalp        -> start autoscalp
+    /autoscalp stop   -> stop autoscalp
+    """
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip().lower()
+
+    if "stop" in text or "off" in text:
+        job = AUTOSCALP_JOBS.pop(chat_id, None)
+        if job:
+            job.schedule_removal()
+            await update.message.reply_text("🛑 Autoscalp stopped. Existing scalps will still be managed until closed.")
+        else:
+            await update.message.reply_text("Autoscalp is not running for this chat.")
+        return
+
+    # Start autoscalp
+    await update.message.reply_text(
+        "⚡ Autoscalp started.\n\n"
+        "- Scans high-volume coins (≥ 50M 24h) on 1m timeframe.\n"
+        "- Looks for scalp setups with tight SL & TP.\n"
+        "- Auto-trades on BingX at 10x leverage with virtual trailing to breakeven.\n"
+        "- Sends open/close + PnL updates here.\n\n"
+        "Use `/autoscalp stop` to stop scalping."
+    )
+
+    if chat_id in AUTOSCALP_JOBS:
+        AUTOSCALP_JOBS[chat_id].schedule_removal()
+
+    job = context.job_queue.run_repeating(
+        autoscalp_job,
+        interval=AUTOSCALP_INTERVAL,
+        first=5,
+        data={"chat": chat_id},
+        name=f"autoscalp_{chat_id}",
+    )
+    AUTOSCALP_JOBS[chat_id] = job
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📈 Gemini + MEXC Futures Bot (Balanced JSON Mode)\n\n"
-        "Auto-scan:\n"
+        "Auto-scan (swing-ish signals):\n"
         "- /start → start autoscan (5m, volume spike + FRVP-style)\n"
         "- /stop → stop autoscan\n\n"
+        "Autoscalp (fast scalps + auto-trade 10x):\n"
+        "- /autoscalp → start autoscalp\n"
+        "- /autoscalp stop → stop autoscalp\n\n"
         "Manual analysis:\n"
         "- `/btcusdt` → multi-TF (5m, 1h, 4h, 1D)\n"
         "- `/suiusdt 4h` → single TF\n"
         "- `/ethusdt 1h` → single TF\n\n"
-        "I only give entry/SL/TP if highest probability ≥ 75%.\n"
+        "I only give entry/SL/TP in manual analysis if highest probability ≥ 75%.\n"
         "Below 75%: I’ll tell you to avoid the trade.\n\n"
-        f"Auto-trade (BingX MARKET 7x): {'ENABLED' if BINGX_ENABLE_AUTOTRADE else 'DISABLED'}",
+        f"Auto-trade (BingX): {'ENABLED' if BINGX_ENABLE_AUTOTRADE else 'DISABLED'}\n"
+        "⚠ Futures trading is very risky. Use at your own risk, preferably start with tiny size or paper trading.",
         parse_mode="Markdown",
     )
 
@@ -652,6 +988,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("autoscalp", cmd_autoscalp))
 
     # All other commands → manual analysis
     app.add_handler(MessageHandler(filters.COMMAND, manual_analyze))
@@ -662,4 +999,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,14 +1,11 @@
-# ================================
-# OPENROUTER (CLAUDE 3.1) + MEXC CRYPTO BOT
-# - Manual analysis (/btcusdt, /suiusdt 4h, etc.)
-# - Autoscan (5m, volume spike + FRVP-style + PA, optional 7x auto-trade)
-# - Autoscalp (/autoscalp) – fast scalps with 10x auto-trade + TP/SL/trailing
-# - Uses OpenRouter /chat/completions with response_format={"type":"json_object"}
-# ================================
+# ===============================================================
+# WEBHOOK VERSION — OPENROUTER (CLAUDE 3.1) + MEXC + AUTOSCAN + AUTOSCALP + BINGX
+# 100% COMPATIBLE WITH RENDER WEB SERVICE (NOT WORKER)
+# ===============================================================
 
 import os
-import time
 import json
+import time
 import hmac
 import hashlib
 import logging
@@ -22,53 +19,55 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
+    CallbackContext,
 )
 
-# ============================================================
-# ENV & BASIC CONFIG
-# ============================================================
+# ===============================================================
+# CONFIG
+# ===============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN").strip()
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY missing")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/anthropic/claude-3.1-sonnet").strip()
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
 
-OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_MODEL", "openrouter/anthropic/claude-3.1-sonnet"
-).strip()
-OPENROUTER_BASE_URL = os.getenv(
-    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-).strip()
+BINGX_API_KEY = os.getenv("BINGX_API_KEY")
+BINGX_API_SECRET = os.getenv("BINGX_API_SECRET")
+BINGX_ENABLE_AUTOTRADE = os.getenv("BINGX_ENABLE_AUTOTRADE", "false").lower() == "true"
+BINGX_TRADE_COST_USDT = float(os.getenv("BINGX_TRADE_COST_USDT", "10"))
+BINGX_BASE_URL = "https://open-api.bingx.com"
+BINGX_LEVERAGE_AUTOSCAN = 7
+BINGX_LEVERAGE_AUTOSCALP = 10
 
 MEXC_URL = "https://contract.mexc.com"
 
-# Autoscan config
-SCAN_INTERVAL = 300      # 5m
-COOLDOWN = 600           # 10m cooldown between batches
-MAX_COINS = 20
-AUTOSCAN = {}
+WEBHOOK_PATH = "/webhook"
+PORT = int(os.getenv("PORT", "10000"))
 
-# Autoscalp config
-AUTOSCALP_INTERVAL = 60  # 1m loop
-AUTOSCALP_JOBS = {}      # chat_id -> job
-AUTOSCALP_POSITIONS = {} # chat_id -> list of open scalps
-BOT_PNL = {}             # chat_id -> cumulative PnL (USDT)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
 
-# Candles per TF (balanced)
 MAX_CANDLES = 60
 
-# Manual timeframe map
+SCAN_INTERVAL = 300
+COOLDOWN = 600
+MAX_COINS = 20
+AUTOSCAN_JOBS = {}
+
+AUTOSCALP_INTERVAL = 60
+AUTOSCALP_JOBS = {}
+AUTOSCALP_POSITIONS = {}
+BOT_PNL = {}
+
 TIMEFRAME_MAP = {
     "5m": ("Min5", "5m"),
     "15m": ("Min15", "15m"),
     "1h": ("Min60", "1h"),
     "4h": ("Hour4", "4h"),
-    "1d": ("Day1", "1D"),
+    "1d": ("Day1", "1D")
 }
-# Multi-TF default for manual analysis
+
 MULTI_TF = [
     ("Min5", "5m"),
     ("Min60", "1h"),
@@ -76,904 +75,584 @@ MULTI_TF = [
     ("Day1", "1D"),
 ]
 
-# BingX auto-trade config
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
-BINGX_ENABLE_AUTOTRADE = os.getenv("BINGX_ENABLE_AUTOTRADE", "false").lower() == "true"
-BINGX_TRADE_COST_USDT = float(os.getenv("BINGX_TRADE_COST_USDT", "10"))
-BINGX_BASE_URL = "https://open-api.bingx.com"
-BINGX_LEVERAGE_AUTOSCAN = 7    # autoscan leverage
-BINGX_LEVERAGE_AUTOSCALP = 10  # autoscalp leverage
+TRAIL_ACTIVATION_PCT = 0.5
 
-# Trailing config for autoscalp
-TRAIL_ACTIVATION_PCT = 0.5  # when move in favor >= 0.5%, move SL to BE
+# ===============================================================
+# HELPERS
+# ===============================================================
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("bot")
-
-
-# ============================================================
-# BASIC HELPERS (MEXC)
-# ============================================================
-
-def symbol_format(cmd: str) -> str:
+def symbol_format(cmd):
     cmd = cmd.strip().lstrip("/").upper()
     if cmd.endswith("USDT"):
         return cmd[:-4] + "_USDT"
-    if "_" in cmd:
-        return cmd
     return cmd + "_USDT"
 
-
-def get_mexc_candles(symbol: str, interval: str, limit: int = MAX_CANDLES):
+def get_mexc_candles(symbol, interval, limit=MAX_CANDLES):
     try:
         url = f"{MEXC_URL}/api/v1/contract/kline/{symbol}"
         now = int(time.time())
         interval_sec = {
-            "Min1": 60, "Min5": 300, "Min15": 900,
-            "Min60": 3600, "Hour4": 14400,
-            "Day1": 86400, "Week1": 604800,
-        }.get(interval, 300)
+            "Min1": 60,
+            "Min5": 300,
+            "Min15": 900,
+            "Min60": 3600,
+            "Hour4": 14400,
+            "Day1": 86400,
+        }.get(interval, 60)
         start_ts = now - interval_sec * limit
-        r = requests.get(
-            url,
-            params={"interval": interval, "start": start_ts, "end": now},
-            timeout=8,
-        ).json()
+        r = requests.get(url, params={"interval":interval,"start":start_ts,"end":now}, timeout=8).json()
         if not r.get("success"):
-            log.warning(f"MEXC kline error for {symbol} {interval}: {r}")
             return []
         d = r["data"]
-        out = []
+        rows=[]
         for i in range(len(d["time"])):
-            out.append(
-                {
-                    "time": int(d["time"][i]),
-                    "open": float(d["open"][i]),
-                    "high": float(d["high"][i]),
-                    "low": float(d["low"][i]),
-                    "close": float(d["close"][i]),
-                    "volume": float(d["vol"][i]),
-                }
-            )
-        return out
-    except Exception as e:
-        log.error(f"get_mexc_candles error: {e}")
+            rows.append({
+                "time":int(d["time"][i]),
+                "open":float(d["open"][i]),
+                "high":float(d["high"][i]),
+                "low":float(d["low"][i]),
+                "close":float(d["close"][i]),
+                "volume":float(d["vol"][i])
+            })
+        return rows
+    except:
         return []
 
-
-def format_candles_for_ai(candles):
-    candles = candles[-MAX_CANDLES:]
+def csv_for_ai(candles):
     lines = ["time,open,high,low,close,volume"]
-    for c in candles:
+    for c in candles[-MAX_CANDLES:]:
         ts = datetime.fromtimestamp(c["time"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        lines.append(
-            f"{ts},{c['open']},{c['high']},{c['low']},{c['close']},{c['volume']}"
-        )
+        lines.append(f"{ts},{c['open']},{c['high']},{c['low']},{c['close']},{c['volume']}")
     return "\n".join(lines)
 
-
-def get_high_volume_coins(min_vol=50_000_000):
+def get_high_volume_coins():
     try:
         r = requests.get(f"{MEXC_URL}/api/v1/contract/ticker", timeout=10).json()
-        coins = []
-        for x in r.get("data", []):
-            sym = x.get("symbol", "")
-            if not sym.endswith("_USDT"):
-                continue
-            vol = float(x.get("amount24", 0))
-            if vol >= min_vol:
-                coins.append((sym, vol))
-        coins.sort(key=lambda p: p[1], reverse=True)
-        return [s for s, _ in coins[:MAX_COINS]]
-    except Exception as e:
-        log.error(f"get_high_volume_coins error: {e}")
+        coins=[]
+        for x in r.get("data",[]):
+            sym=x.get("symbol","")
+            if sym.endswith("_USDT"):
+                vol=float(x.get("amount24",0))
+                if vol>=50_000_000:
+                    coins.append((sym,vol))
+        coins.sort(key=lambda x:x[1], reverse=True)
+        return [x[0] for x in coins[:MAX_COINS]]
+    except:
         return []
 
+# ===============================================================
+# OPENROUTER JSON CALL
+# ===============================================================
 
-# ============================================================
-# OPENROUTER CHAT (JSON)
-# ============================================================
-
-def _parse_json_text(text: str):
-    if not text:
-        return None
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, str):
-            try:
-                return json.loads(obj)
-            except Exception:
-                return None
-        return obj
-    except Exception as e:
-        log.error(f"json.loads error: {e}")
-        return None
-
-
-def openrouter_json(system_prompt: str, user_prompt: str):
-    """
-    Call OpenRouter /chat/completions with response_format json_object.
-    """
+def openrouter_json(system, user):
     try:
         url = f"{OPENROUTER_BASE_URL}/chat/completions"
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "X-Title": "MEXC-BingX-TG-Bot",
+            "Content-Type": "application/json"
         }
         payload = {
             "model": OPENROUTER_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+            "messages":[
+                {"role":"system","content":system},
+                {"role":"user","content":user}
             ],
-            "temperature": 0.2,
-            "top_p": 0.85,
-            "response_format": {"type": "json_object"},
+            "response_format":{"type":"json_object"},
+            "temperature":0.2
         }
         r = requests.post(url, headers=headers, json=payload, timeout=40)
         data = r.json()
-        if "choices" not in data or not data["choices"]:
-            log.error(f"OpenRouter bad response: {data}")
-            return None
         content = data["choices"][0]["message"]["content"]
-        return _parse_json_text(content)
+        return json.loads(content)
     except Exception as e:
-        log.error(f"OpenRouter request error: {e}")
+        log.error(f"OpenRouter error: {e}")
         return None
 
-
-# ============================================================
-# PROMPTS
-# ============================================================
-
-AUTOSCAN_SCHEMA_DESC = """
-{
-  "upside_prob": int,
-  "downside_prob": int,
-  "flat_prob": int,
-  "dominant_scenario": "upside" | "downside" | "flat",
-  "trade_plan": null | {
-     "direction": "long" | "short",
-     "entry": float,
-     "stop_loss": float,
-     "take_profits": [float, ...],
-     "min_rr": float
-  }
-}
-"""
-
-MANUAL_SCHEMA_DESC = """
-{
-  "upside_prob": int,
-  "downside_prob": int,
-  "flat_prob": int,
-  "dominant_scenario": "upside" | "downside" | "flat",
-  "trade_plan": null | {
-     "direction": "long" | "short",
-     "entry": float,
-     "stop_loss": float,
-     "take_profits": [float, ...],
-     "min_rr": float
-  },
-  "summary": "short explanation"
-}
-"""
-
-AUTOSCALP_SCHEMA_DESC = """
-{
-  "take_trade": bool,
-  "direction": "long" | "short",
-  "probability": int,
-  "entry": float,
-  "stop_loss": float,
-  "take_profit": float
-}
-"""
-
-
-def build_autoscan_prompts(symbol: str, csv_block: str):
-    system = f"""
-You are a professional crypto futures trader.
-
-Your job is to analyse 5m MEXC futures data and output a SINGLE JSON object
-with this exact structure:
-
-{AUTOSCAN_SCHEMA_DESC}
-
-Rules:
-- Use the CSV OHLCV data I provide (time,open,high,low,close,volume).
-- Focus on:
-  - Sudden volume spikes vs last ~30 candles.
-  - Rough fixed-range volume profile between recent swing high & low.
-  - Price action and candles at these key areas.
-  - Trend structure (HH/HL vs LH/LL).
-
-- Compute realistic probabilities (0-100) for upside, downside, flat.
-- dominant_scenario = the one with highest probability.
-- highest_prob = max(ups, downs, flat).
-
-- If highest_prob < 82 → trade_plan MUST be null.
-- If highest_prob >= 82:
-    * If upside dominant → LONG.
-    * If downside dominant → SHORT.
-    * entry: logical retest / level supported by structure + volume.
-    * stop_loss: beyond recent swing high/low (avoid easy stop hunts).
-    * take_profits: 1-2 PTs.
-    * min_rr >= 1.9.
-
-Return ONLY valid JSON, no explanation text.
-"""
-    user = f"PAIR: {symbol}\nTIMEFRAME: 5m\n\nCSV OHLCV DATA:\n{csv_block}"
-    return system, user
-
-
-def build_manual_prompts(symbol: str, tf_blocks: dict, requested_tf: str | None):
-    scope = (
-        f"Focus ONLY on timeframe {requested_tf}."
-        if requested_tf
-        else "Use 5m/1h/4h/1D together: higher TF for bias, lower TF for entry timing."
-    )
-    sections = []
-    for label, csv in tf_blocks.items():
-        sections.append(f"\n=== TF {label} ===\n{csv}")
-    all_csv = "".join(sections)
-
-    system = f"""
-You are a world-class crypto futures trader and risk manager.
-
-You must output a SINGLE JSON object with this structure:
-
-{MANUAL_SCHEMA_DESC}
-
-PAIR: {symbol}
-
-{scope}
-
-From the OHLCV data:
-- Estimate natural probabilities (0-100) for upside, downside, flat.
-- Do NOT force them to 75. If the market is messy, increase flat_prob.
-- Use trend, support/resistance, wicks, candle patterns, and rough volume profile.
-
-Trade rules:
-- highest_prob = max(ups, downs, flat).
-- If highest_prob < 75 → trade_plan MUST be null (avoid trade).
-- If highest_prob >= 75:
-    * If upside dominant → LONG.
-    * If downside dominant → SHORT.
-    * entry: logical retest / SR / breakout level.
-    * stop_loss: beyond recent clear swing.
-    * take_profits: 1–2 levels, min_rr >= 1.9.
-
-summary: 1–3 sentences max, very short.
-
-Return ONLY JSON, no extra text.
-"""
-    user = f"PAIR: {symbol}\n\nMULTI-TIMEFRAME CSV DATA:\n{all_csv}"
-    return system, user
-
-
-def build_autoscalp_prompts(symbol: str, csv_block: str):
-    system = f"""
-You are a high-frequency crypto scalper.
-
-You must output a SINGLE JSON object with this structure:
-
-{AUTOSCALP_SCHEMA_DESC}
-
-PAIR: {symbol}
-TIMEFRAME: 1m.
-
-Goal:
-- Catch short intraday moves with tight SL and TP.
-- Capturing 0.7–1.5% moves is acceptable if reward > risk.
-
-Logic:
-- Look for:
-  - sudden volume increase vs recent candles,
-  - micro breakouts / breakdowns,
-  - strong candle confirmations (engulfing, hammer, long wicks),
-  - very near support/resistance flips.
-
-- Decide if there is a clean scalp RIGHT NOW.
-- If not, set take_trade = false and ignore the rest.
-
-- If yes:
-  - take_trade = true
-  - direction = "long" or "short"
-  - probability = your confidence (0–100)
-  - entry = logical fair entry near current price
-  - stop_loss = tight SL beyond micro swing
-  - take_profit = realistic scalp target (around 0.7–1.5% away)
-
-Soft rule:
-- Only set take_trade=true if probability >= 75.
-The caller will only execute if probability >= 80.
-
-Return ONLY JSON, no extra text.
-"""
-    user = f"PAIR: {symbol}\nTIMEFRAME: 1m\n\nCSV OHLCV DATA:\n{csv_block}"
-    return system, user
-
-
-# ============================================================
+# ===============================================================
 # BINGX HELPERS
-# ============================================================
+# ===============================================================
 
-def mexc_to_bingx_symbol(sym: str) -> str:
-    return sym.replace("_", "-")
+def mexc_to_bingx(sym):
+    return sym.replace("_","-")
 
-
-def bingx_sign(params: dict) -> str:
-    qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    sig = hmac.new(BINGX_API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+def sign_bingx(params):
+    qs="&".join(f"{k}={params[k]}" for k in sorted(params))
+    sig=hmac.new(BINGX_API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return f"{qs}&signature={sig}"
 
-
-def bingx_get_price(symbol: str) -> float | None:
+def bingx_price(symbol):
     try:
-        r = requests.get(
+        r=requests.get(
             f"{BINGX_BASE_URL}/openApi/swap/v2/quote/price",
-            params={"symbol": symbol},
-            timeout=8,
+            params={"symbol":symbol},
+            timeout=8
         ).json()
-        if r.get("success") and r.get("data"):
+        if r.get("success"):
             return float(r["data"]["price"])
-    except Exception as e:
-        log.error(f"bingx_get_price error: {e}")
+    except:
+        pass
     return None
 
+def bingx_open(symbol, direction, lev, cost):
+    if not BINGX_ENABLE_AUTOTRADE:
+        return {"success":False}
 
-def bingx_place_market(symbol: str, direction: str, leverage: float, cost_usdt: float):
-    """
-    Open MARKET position on BingX.
-    Returns dict with success, qty, entry_price.
-    """
-    if not (BINGX_API_KEY and BINGX_API_SECRET):
-        log.info("BingX keys missing, skipping auto-trade.")
-        return {"success": False, "qty": 0.0, "entry_price": None, "raw": None}
+    px = bingx_price(symbol)
+    if not px:
+        return {"success":False}
 
-    price = bingx_get_price(symbol)
-    if not price or price <= 0:
-        log.warning(f"No BingX price for {symbol}")
-        return {"success": False, "qty": 0.0, "entry_price": None, "raw": None}
-
-    notional = cost_usdt * leverage
-    qty = notional / price
+    notional = cost*lev
+    qty = notional/px
     qty = float(f"{qty:.6f}")
 
-    side = "BUY" if direction == "long" else "SELL"
-    pos_side = "LONG" if direction == "long" else "SHORT"
+    side="BUY" if direction=="long" else "SELL"
+    pos="LONG" if direction=="long" else "SHORT"
 
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "positionSide": pos_side,
-        "type": "MARKET",
-        "quantity": qty,
-        "timestamp": int(time.time() * 1000),
+    params={
+        "symbol":symbol,
+        "side":side,
+        "positionSide":pos,
+        "type":"MARKET",
+        "quantity":qty,
+        "timestamp":int(time.time()*1000)
     }
+    url=f"{BINGX_BASE_URL}/openApi/swap/v2/trade/order?{sign_bingx(params)}"
+    headers={"X-BX-APIKEY":BINGX_API_KEY}
 
-    url = f"{BINGX_BASE_URL}/openApi/swap/v2/trade/order?{bingx_sign(params)}"
-    headers = {"X-BX-APIKEY": BINGX_API_KEY}
     try:
-        r = requests.post(url, headers=headers, timeout=10).json()
-        log.info(f"BingX open order response: {r}")
-        success = bool(r.get("success"))
-        return {"success": success, "qty": qty, "entry_price": price, "raw": r}
-    except Exception as e:
-        log.error(f"bingx_place_market error: {e}")
-        return {"success": False, "qty": 0.0, "entry_price": None, "raw": None}
+        r=requests.post(url, headers=headers, timeout=10).json()
+        if r.get("success"):
+            return {"success":True,"qty":qty,"entry":px}
+        return {"success":False}
+    except:
+        return {"success":False}
 
+def bingx_close(symbol, direction, qty):
+    side="SELL" if direction=="long" else "BUY"
+    pos="LONG" if direction=="long" else "SHORT"
 
-def bingx_close_market(symbol: str, original_direction: str, qty: float):
-    if not (BINGX_API_KEY and BINGX_API_SECRET):
-        return {"success": False, "raw": None}
-
-    side = "SELL" if original_direction == "long" else "BUY"
-    pos_side = "LONG" if original_direction == "long" else "SHORT"
-
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "positionSide": pos_side,
-        "type": "MARKET",
-        "quantity": float(f"{qty:.6f}"),
-        "timestamp": int(time.time() * 1000),
+    params={
+        "symbol":symbol,
+        "side":side,
+        "positionSide":pos,
+        "type":"MARKET",
+        "quantity":qty,
+        "timestamp":int(time.time()*1000)
     }
-    url = f"{BINGX_BASE_URL}/openApi/swap/v2/trade/order?{bingx_sign(params)}"
-    headers = {"X-BX-APIKEY": BINGX_API_KEY}
+    url=f"{BINGX_BASE_URL}/openApi/swap/v2/trade/order?{sign_bingx(params)}"
+    headers={"X-BX-APIKEY":BINGX_API_KEY}
+
     try:
-        r = requests.post(url, headers=headers, timeout=10).json()
-        log.info(f"BingX close order response: {r}")
-        return {"success": bool(r.get("success")), "raw": r}
-    except Exception as e:
-        log.error(f"bingx_close_market error: {e}")
-        return {"success": False, "raw": None}
+        r=requests.post(url, headers=headers, timeout=10).json()
+        return r.get("success",False)
+    except:
+        return False
 
-
-# ============================================================
+# ===============================================================
 # AUTOSCAN JOB
-# ============================================================
+# ===============================================================
 
-async def autoscan_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    chat_id = data["chat"]
-    last_ts = data.get("last", 0.0)
-    now = time.time()
-
-    if now - last_ts < COOLDOWN:
+async def autoscan_job(context:CallbackContext):
+    data=context.job.data
+    chat_id=data["chat"]
+    last=data.get("last",0)
+    now=time.time()
+    if now-last<COOLDOWN:
         return
 
-    symbols = get_high_volume_coins()
-    if not symbols:
+    syms=get_high_volume_coins()
+    if not syms:
         return
 
-    log.info(f"Autoscan symbols: {symbols}")
-    messages = []
+    msgs=[]
 
-    for sym in symbols:
-        candles = get_mexc_candles(sym, "Min5", MAX_CANDLES)
-        if len(candles) < 30:
+    for sym in syms:
+        candles=get_mexc_candles(sym,"Min5")
+        if len(candles)<30:
             continue
 
-        csv = format_candles_for_ai(candles)
-        system, user = build_autoscan_prompts(sym, csv)
-        result = openrouter_json(system, user)
-        if not result:
+        csv=csv_for_ai(candles)
+
+        system=f"""
+You output this JSON ONLY:
+{{
+  "upside_prob":int,
+  "downside_prob":int,
+  "flat_prob":int,
+  "dominant_scenario":"upside"|"downside"|"flat",
+  "trade_plan":null|{{
+     "direction":"long"|"short",
+     "entry":float,
+     "stop_loss":float,
+     "take_profits":[float],
+     "min_rr":float
+  }}
+}}
+Only give JSON, no explanation.
+"""
+
+        user=f"PAIR:{sym}\nCSV:\n{csv}"
+
+        res=openrouter_json(system,user)
+        if not res:
             continue
 
-        up = int(result.get("upside_prob", 0))
-        dn = int(result.get("downside_prob", 0))
-        fl = int(result.get("flat_prob", 0))
-        dom = result.get("dominant_scenario", "flat")
-        plan = result.get("trade_plan")
-
-        highest = max(up, dn, fl)
-        if highest < 82 or not plan:
+        up=res["upside_prob"]
+        dn=res["downside_prob"]
+        fl=res["flat_prob"]
+        dom=res["dominant_scenario"]
+        plan=res["trade_plan"]
+        if max(up,dn,fl)<82 or not plan:
             continue
 
-        direction = plan.get("direction")
-        entry = plan.get("entry")
-        sl = plan.get("stop_loss")
-        tps = plan.get("take_profits") or []
-        rr = float(plan.get("min_rr", 0.0))
+        direction=plan["direction"]
+        entry=plan["entry"]
+        sl=plan["stop_loss"]
+        tps=plan["take_profits"]
 
-        if not direction or entry is None or sl is None or not tps:
-            continue
-
-        tp_str = ", ".join(f"{float(x):.6f}" for x in tps)
-
-        trade_info = ""
+        trade_msg=""
         if BINGX_ENABLE_AUTOTRADE:
-            bx_sym = mexc_to_bingx_symbol(sym)
-            resp = bingx_place_market(
-                bx_sym, direction, BINGX_LEVERAGE_AUTOSCAN, BINGX_TRADE_COST_USDT
-            )
+            bx=mexc_to_bingx(sym)
+            resp=bingx_open(bx, direction, BINGX_LEVERAGE_AUTOSCAN, BINGX_TRADE_COST_USDT)
             if resp["success"]:
-                trade_info = "\nAuto-trade: ✅ BingX MARKET 7x order placed."
+                trade_msg="\nAuto-trade: EXECUTED"
             else:
-                trade_info = "\nAuto-trade: ❌ Failed (check logs/API)."
+                trade_msg="\nAuto-trade: FAILED"
 
-        messages.append(
-            f"📡 AUTO SIGNAL\n"
-            f"{sym}\n"
-            f"Scenario: {dom.upper()} (Up {up}% / Down {dn}% / Flat {fl}%)\n"
-            f"Direction: {direction.upper()}\n"
-            f"Entry: {float(entry):.6f}\n"
-            f"SL: {float(sl):.6f}\n"
-            f"TPs: {tp_str}\n"
-            f"Min RR: {rr:.2f}"
-            f"{trade_info}"
+        msgs.append(
+            f"📡 AUTO SIGNAL {sym}\n"
+            f"Scenario:{dom.upper()} (Up {up}% / Down {dn}% / Flat {fl}%)\n"
+            f"Dir:{direction.upper()}\n"
+            f"Entry:{entry}\nSL:{sl}\nTPs:{tps}{trade_msg}"
         )
 
-    if messages:
-        data["last"] = now
-        context.job.data = data
-        await context.bot.send_message(chat_id=chat_id, text="\n\n".join(messages))
+    if msgs:
+        data["last"]=now
+        context.job.data=data
+        await context.bot.send_message(chat_id, "\n\n".join(msgs))
 
-
-# ============================================================
+# ===============================================================
 # AUTOSCALP JOB
-# ============================================================
+# ===============================================================
 
-async def autoscalp_job(context: ContextTypes.DEFAULT_TYPE):
-    job_data = context.job.data
-    chat_id = job_data["chat"]
+async def autoscalp_job(context:CallbackContext):
+    data=context.job.data
+    chat_id=data["chat"]
 
-    positions = AUTOSCALP_POSITIONS.setdefault(chat_id, [])
-    bot_pnl = BOT_PNL.setdefault(chat_id, 0.0)
+    positions = AUTOSCALP_POSITIONS.setdefault(chat_id,[])
+    pnl = BOT_PNL.setdefault(chat_id,0.0)
 
-    # 1) Manage existing scalps
+    # Manage open scalps
     for pos in positions[:]:
-        symbol_bx = pos["symbol_bx"]
-        direction = pos["direction"]
-        qty = pos["qty"]
-        entry = pos["entry"]
-        sl = pos["sl"]
-        tp = pos["tp"]
-        trail_active = pos["trail_active"]
-        trail_sl = pos["trail_sl"]
+        sym=pos["sym"]
+        bx=pos["bx"]
+        direction=pos["direction"]
+        qty=pos["qty"]
+        entry=pos["entry"]
+        sl=pos["sl"]
+        tp=pos["tp"]
+        trail=pos["trail"]
+        trail_sl=pos["trail_sl"]
 
-        price = bingx_get_price(symbol_bx)
-        if not price:
+        px=bingx_price(bx)
+        if not px:
             continue
 
-        hit = None
-        exit_price = None
+        hit=None
+        exit_price=None
 
-        if direction == "long":
-            if not trail_active and price >= entry * (1 + TRAIL_ACTIVATION_PCT / 100):
-                trail_active = True
-                trail_sl = entry
-                pos["trail_active"] = True
-                pos["trail_sl"] = trail_sl
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔁 Trailing activated on {symbol_bx} LONG. SL moved to BE {entry:.6f}",
-                )
-            if price >= tp:
-                hit = "TP"
-                exit_price = tp
-            elif price <= sl and not trail_active:
-                hit = "SL"
-                exit_price = sl
-            elif trail_active and price <= trail_sl:
-                hit = "TRAIL_SL"
-                exit_price = price
-        else:  # short
-            if not trail_active and price <= entry * (1 - TRAIL_ACTIVATION_PCT / 100):
-                trail_active = True
-                trail_sl = entry
-                pos["trail_active"] = True
-                pos["trail_sl"] = trail_sl
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🔁 Trailing activated on {symbol_bx} SHORT. SL moved to BE {entry:.6f}",
-                )
-            if price <= tp:
-                hit = "TP"
-                exit_price = tp
-            elif price >= sl and not trail_active:
-                hit = "SL"
-                exit_price = sl
-            elif trail_active and price >= trail_sl:
-                hit = "TRAIL_SL"
-                exit_price = price
+        if direction=="long":
+            if not trail and px>=entry*(1+TRAIL_ACTIVATION_PCT/100):
+                pos["trail"]=True
+                pos["trail_sl"]=entry
+                await context.bot.send_message(chat_id,"Trailing activated LONG")
+            if px>=tp:
+                hit="TP"; exit_price=tp
+            elif px<=sl and not trail:
+                hit="SL"; exit_price=sl
+            elif trail and px<=trail_sl:
+                hit="TRAIL_SL"; exit_price=px
+        else:
+            if not trail and px<=entry*(1-TRAIL_ACTIVATION_PCT/100):
+                pos["trail"]=True
+                pos["trail_sl"]=entry
+                await context.bot.send_message(chat_id,"Trailing activated SHORT")
+            if px<=tp:
+                hit="TP"; exit_price=tp
+            elif px>=sl and not trail:
+                hit="SL"; exit_price=sl
+            elif trail and px>=trail_sl:
+                hit="TRAIL_SL"; exit_price=px
 
         if hit:
-            close_resp = bingx_close_market(symbol_bx, direction, qty)
-            if not close_resp["success"]:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⚠️ Tried to close {symbol_bx} {direction.upper()} on {hit}, but close failed. Check exchange.",
-                )
+            closed=bingx_close(bx, direction, qty)
+            if not closed:
                 continue
 
-            if direction == "long":
-                pnl = (exit_price - entry) * qty
-            else:
-                pnl = (entry - exit_price) * qty
-            pnl_pct = (pnl / BINGX_TRADE_COST_USDT) * 100.0
-            bot_pnl += pnl
-            BOT_PNL[chat_id] = bot_pnl
+            profit=(exit_price-entry)*qty if direction=="long" else (entry-exit_price)*qty
+            pnl+=profit
+            BOT_PNL[chat_id]=pnl
 
             await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"✅ Autoscalp {hit} on {symbol_bx} {direction.upper()}\n"
-                    f"Entry: {entry:.6f}\n"
-                    f"Exit: {exit_price:.6f}\n"
-                    f"Qty: {qty:.6f}\n"
-                    f"PnL: {pnl:.2f} USDT ({pnl_pct:.2f}%)\n"
-                    f"Bot cumulative PnL: {bot_pnl:.2f} USDT"
-                ),
+                chat_id,
+                f"Autoscalp CLOSED ({hit}) {bx} {direction}\n"
+                f"Entry:{entry}\nExit:{exit_price}\nPnL:{profit:.3f}\nCumulative:{pnl:.2f}"
             )
             positions.remove(pos)
 
-    # 2) Look for new scalps if we have capacity
-    MAX_OPEN_SCALPS = 3
-    if len(positions) >= MAX_OPEN_SCALPS:
+    # Open new scalps if <3 positions
+    if len(positions)>=3:
         return
 
-    symbols = get_high_volume_coins()
-    if not symbols:
+    syms=get_high_volume_coins()
+    if not syms:
         return
 
-    for sym in symbols:
-        if len(positions) >= MAX_OPEN_SCALPS:
+    for sym in syms:
+        if len(positions)>=3:
             break
 
-        candles = get_mexc_candles(sym, "Min1", MAX_CANDLES)
-        if len(candles) < 20:
+        candles=get_mexc_candles(sym,"Min1")
+        if len(candles)<20:
             continue
 
-        csv = format_candles_for_ai(candles)
-        system, user = build_autoscalp_prompts(sym, csv)
-        result = openrouter_json(system, user)
-        if not result:
+        csv=csv_for_ai(candles)
+
+        system=f"""
+Only return JSON:
+{{
+ "take_trade":bool,
+ "direction":"long"|"short",
+ "probability":int,
+ "entry":float,
+ "stop_loss":float,
+ "take_profit":float
+}}
+"""
+
+        user=f"PAIR:{sym}\n1m CSV:\n{csv}"
+
+        res=openrouter_json(system,user)
+        if not res:
             continue
 
-        take_trade = bool(result.get("take_trade", False))
-        direction = result.get("direction")
-        prob = int(result.get("probability", 0))
-        entry_ai = result.get("entry")
-        sl_ai = result.get("stop_loss")
-        tp_ai = result.get("take_profit")
-
-        if not take_trade or prob < 80:
-            continue
-        if direction not in ("long", "short") or entry_ai is None or sl_ai is None or tp_ai is None:
+        if not res["take_trade"] or res["probability"]<80:
             continue
 
-        bx_sym = mexc_to_bingx_symbol(sym)
-        open_resp = bingx_place_market(
-            bx_sym, direction, BINGX_LEVERAGE_AUTOSCALP, BINGX_TRADE_COST_USDT
-        )
-        if not open_resp["success"]:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Autoscalp: BingX order failed for {bx_sym} {direction.upper()}.",
-            )
+        direction=res["direction"]
+        entry_ai=res["entry"]
+        sl=res["stop_loss"]
+        tp=res["take_profit"]
+
+        bx=mexc_to_bingx(sym)
+        resp=bingx_open(bx, direction, BINGX_LEVERAGE_AUTOSCALP, BINGX_TRADE_COST_USDT)
+        if not resp["success"]:
             continue
 
-        qty = open_resp["qty"]
-        entry_fill = open_resp["entry_price"]
+        qty=resp["qty"]
+        entry_fill=resp["entry"]
 
-        position = {
-            "symbol_mexc": sym,
-            "symbol_bx": bx_sym,
-            "direction": direction,
-            "entry": entry_fill,
-            "sl": float(sl_ai),
-            "tp": float(tp_ai),
-            "qty": qty,
-            "trail_active": False,
-            "trail_sl": float(sl_ai),
-            "opened_at": time.time(),
+        pos={
+            "sym":sym,
+            "bx":bx,
+            "direction":direction,
+            "entry":entry_fill,
+            "sl":sl,
+            "tp":tp,
+            "qty":qty,
+            "trail":False,
+            "trail_sl":sl
         }
-        positions.append(position)
+        positions.append(pos)
 
         await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚡ AUTOSCALP OPENED\n"
-                f"{bx_sym} {direction.upper()} (10x)\n"
-                f"AI Prob: {prob}%\n"
-                f"Entry (fill): {entry_fill:.6f}\n"
-                f"SL: {float(sl_ai):.6f}\n"
-                f"TP: {float(tp_ai):.6f}\n"
-                f"Trailing: BE after +{TRAIL_ACTIVATION_PCT:.2f}% move"
-            ),
+            chat_id,
+            f"Autoscalp OPENED {bx} {direction}\nEntry:{entry_fill}\nSL:{sl}\nTP:{tp}"
         )
 
-
-# ============================================================
+# ===============================================================
 # MANUAL ANALYSIS
-# ============================================================
+# ===============================================================
 
-async def manual_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+async def manual(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    text=update.message.text.strip()
+    parts=text.lstrip("/").split()
+    cmd=parts[0].lower()
+
+    if cmd in ("start","stop","autoscalp","help"):
         return
 
-    text = update.message.text.strip()
-    parts = text.lstrip("/").split()
-    if not parts:
-        return
+    tf=parts[1].lower() if len(parts)>1 else None
+    symbol=symbol_format(cmd)
 
-    cmd = parts[0].lower()
-    if cmd in ("start", "stop", "help", "autoscalp"):
-        return
+    await update.message.reply_text("Analysing...")
 
-    tf_arg = parts[1].lower() if len(parts) > 1 else None
-    symbol = symbol_format(cmd)
+    tf_blocks={}
+    req_tf=None
 
-    await update.message.reply_text("🔍 Analysing, please wait...")
-
-    tf_blocks = {}
-    requested_tf_label = None
-
-    if tf_arg and tf_arg in TIMEFRAME_MAP:
-        interval, label = TIMEFRAME_MAP[tf_arg]
-        requested_tf_label = label
-        candles = get_mexc_candles(symbol, interval, MAX_CANDLES)
+    if tf and tf in TIMEFRAME_MAP:
+        interval,label=TIMEFRAME_MAP[tf]
+        req_tf=label
+        candles=get_mexc_candles(symbol,interval)
         if not candles:
-            await update.message.reply_text("❌ Could not fetch data for that timeframe.")
+            await update.message.reply_text("No data.")
             return
-        tf_blocks[label] = format_candles_for_ai(candles)
+        tf_blocks[label]=csv_for_ai(candles)
     else:
-        for interval, label in MULTI_TF:
-            candles = get_mexc_candles(symbol, interval, MAX_CANDLES)
+        for interval,label in MULTI_TF:
+            candles=get_mexc_candles(symbol,interval)
             if candles:
-                tf_blocks[label] = format_candles_for_ai(candles)
-        if not tf_blocks:
-            await update.message.reply_text("❌ No data available for this pair.")
-            return
+                tf_blocks[label]=csv_for_ai(candles)
 
-    system, user = build_manual_prompts(symbol, tf_blocks, requested_tf_label)
-    result = openrouter_json(system, user)
-    if not result:
-        await update.message.reply_text("❌ OpenRouter could not produce valid JSON. Try again.")
+    system=f"""
+Return ONLY this JSON:
+{{
+ "upside_prob":int,
+ "downside_prob":int,
+ "flat_prob":int,
+ "dominant_scenario":"upside"|"downside"|"flat",
+ "trade_plan":null|{{
+    "direction":"long"|"short",
+    "entry":float,
+    "stop_loss":float,
+    "take_profits":[float],
+    "min_rr":float
+ }},
+ "summary":"short text"
+}}
+"""
+
+    user=f"PAIR:{symbol}\n{tf_blocks}"
+
+    res=openrouter_json(system,user)
+    if not res:
+        await update.message.reply_text("❌ JSON error.")
         return
 
-    up = int(result.get("upside_prob", 0))
-    dn = int(result.get("downside_prob", 0))
-    fl = int(result.get("flat_prob", 0))
-    dom = result.get("dominant_scenario", "flat")
-    plan = result.get("trade_plan")
-    summary = (result.get("summary") or "").strip()
+    up=res["upside_prob"]
+    dn=res["downside_prob"]
+    fl=res["flat_prob"]
+    dom=res["dominant_scenario"]
+    plan=res["trade_plan"]
+    summary=res["summary"]
 
-    highest = max(up, dn, fl)
+    msg=[
+        f"📊 {symbol}",
+        f"Upside:{up}%  Down:{dn}%  Flat:{fl}%",
+        f"Dominant:{dom.upper()}",
+        ""
+    ]
 
-    lines = []
-    lines.append(f"📊 *{symbol}* analysis")
-    if requested_tf_label:
-        lines.append(f"Timeframe: *{requested_tf_label}*")
+    if plan and max(up,dn,fl)>=75:
+        msg.append("🎯 TRADE PLAN:")
+        msg.append(f"Direction:{plan['direction'].upper()}")
+        msg.append(f"Entry:{plan['entry']}")
+        msg.append(f"SL:{plan['stop_loss']}")
+        msg.append(f"TPs:{plan['take_profits']}")
+        msg.append(f"RR:{plan['min_rr']}")
+        msg.append("")
     else:
-        lines.append("Timeframe: *Multi-TF (5m, 1h, 4h, 1D)*")
-    lines.append("")
-    lines.append(f"Upside: {up}%")
-    lines.append(f"Downside: {dn}%")
-    lines.append(f"Flat/Choppy: {fl}%")
-    lines.append(f"Dominant: *{dom.upper()}*")
-    lines.append("")
+        msg.append("⚠️ No high-probability setup.")
 
-    if plan and highest >= 75 and dom in ("upside", "downside"):
-        direction = plan.get("direction")
-        entry = plan.get("entry")
-        sl = plan.get("stop_loss")
-        tps = plan.get("take_profits") or []
-        rr = float(plan.get("min_rr", 0.0))
+    msg.append(f"🧠 {summary}")
 
-        if direction and entry is not None and sl is not None and tps:
-            tp_str = ", ".join(f"{float(x):.6f}" for x in tps)
-            lines.append("🎯 *Trade idea* (for study only):")
-            lines.append(f"- Direction: *{direction.upper()}*")
-            lines.append(f"- Entry: `{float(entry):.6f}`")
-            lines.append(f"- SL: `{float(sl):.6f}`")
-            lines.append(f"- TP(s): `{tp_str}`")
-            lines.append(f"- Min RR: `{rr:.2f}`")
-            lines.append("")
-        else:
-            lines.append("No clean trade plan extracted.")
-    else:
-        lines.append(
-            "⚠️ Highest probability < 75% or market too choppy.\n"
-            "➡️ Better to avoid this setup."
-        )
-        lines.append("")
+    await update.message.reply_text("\n".join(msg))
 
-    if summary:
-        lines.append(f"🧠 {summary}")
-        lines.append("")
+# ===============================================================
+# COMMANDS
+# ===============================================================
 
-    lines.append("⚠️ Use this as decision support, not guaranteed profit. Manage risk carefully.")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ============================================================
-# COMMAND HANDLERS
-# ============================================================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+async def cmd_start(update:Update, context:CallbackContext):
+    chat_id=update.effective_chat.id
 
     await update.message.reply_text(
-        "🚀 Auto-scan started.\n\n"
-        "- Every 5 minutes: scan MEXC USDT futures with 24h volume ≥ 50M.\n"
-        "- Logic: volume spike + FRVP-style + price action.\n"
-        "- Signals only if probability ≥ 82% and RR ≥ 1.9.\n"
-        f"- Auto-trade BingX (autoscan): {'ON ✅' if BINGX_ENABLE_AUTOTRADE else 'OFF ❌'}"
+        "Autoscan started.\nRuns every 5 minutes.\n"
+        f"Auto-trade:{'ON' if BINGX_ENABLE_AUTOTRADE else 'OFF'}"
     )
 
-    if chat_id in AUTOSCAN:
-        AUTOSCAN[chat_id].schedule_removal()
+    if chat_id in AUTOSCAN_JOBS:
+        AUTOSCAN_JOBS[chat_id].schedule_removal()
 
-    job = context.job_queue.run_repeating(
+    job=context.job_queue.run_repeating(
         autoscan_job,
         interval=SCAN_INTERVAL,
         first=5,
-        data={"chat": chat_id, "last": 0.0},
-        name=f"autoscan_{chat_id}",
+        data={"chat":chat_id,"last":0}
     )
-    AUTOSCAN[chat_id] = job
+    AUTOSCAN_JOBS[chat_id]=job
 
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    job = AUTOSCAN.pop(chat_id, None)
+async def cmd_stop(update:Update, context:CallbackContext):
+    chat_id=update.effective_chat.id
+    job=AUTOSCAN_JOBS.pop(chat_id,None)
     if job:
         job.schedule_removal()
-        await update.message.reply_text("🛑 Auto-scan stopped.")
+        await update.message.reply_text("Autoscan stopped.")
     else:
-        await update.message.reply_text("Auto-scan is not running for this chat.")
+        await update.message.reply_text("Not running.")
 
+async def cmd_autoscalp(update:Update, context:CallbackContext):
+    chat_id=update.effective_chat.id
+    text=(update.message.text or "").lower()
 
-async def cmd_autoscalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip().lower()
-
-    if "stop" in text or "off" in text:
-        job = AUTOSCALP_JOBS.pop(chat_id, None)
+    if "stop" in text:
+        job=AUTOSCALP_JOBS.pop(chat_id,None)
         if job:
             job.schedule_removal()
-            await update.message.reply_text(
-                "🛑 Autoscalp stopped. Existing scalps will still be managed until closed."
-            )
+            await update.message.reply_text("Autoscalp STOPPED.")
         else:
-            await update.message.reply_text("Autoscalp is not running for this chat.")
+            await update.message.reply_text("Autoscalp not running.")
         return
 
     await update.message.reply_text(
-        "⚡ Autoscalp started.\n\n"
-        "- Scans high-volume coins (≥ 50M 24h) on 1m timeframe.\n"
-        "- Looks for scalp setups with tight SL & TP.\n"
-        "- Auto-trades on BingX at 10x leverage with trailing to breakeven.\n"
-        "- Sends open/close + PnL updates here.\n\n"
-        "Use `/autoscalp stop` to stop scalping."
+        "Autoscalp STARTED.\nRuns every 1 minute."
     )
 
     if chat_id in AUTOSCALP_JOBS:
         AUTOSCALP_JOBS[chat_id].schedule_removal()
 
-    job = context.job_queue.run_repeating(
+    job=context.job_queue.run_repeating(
         autoscalp_job,
         interval=AUTOSCALP_INTERVAL,
         first=5,
-        data={"chat": chat_id},
-        name=f"autoscalp_{chat_id}",
+        data={"chat":chat_id}
     )
-    AUTOSCALP_JOBS[chat_id] = job
+    AUTOSCALP_JOBS[chat_id]=job
 
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update:Update, context:CallbackContext):
     await update.message.reply_text(
-        "📈 OpenRouter (Claude 3.1) + MEXC Futures Bot\n\n"
-        "Auto-scan (swing-ish signals):\n"
-        "- /start → start autoscan (5m, volume spike + FRVP-style)\n"
-        "- /stop → stop autoscan\n\n"
-        "Autoscalp (fast scalps + 10x auto-trade):\n"
-        "- /autoscalp → start autoscalp\n"
-        "- /autoscalp stop → stop autoscalp\n\n"
-        "Manual analysis:\n"
-        "- `/btcusdt` → multi-TF (5m, 1h, 4h, 1D)\n"
-        "- `/suiusdt 4h` → single TF\n"
-        "- `/ethusdt 1h` → single TF\n\n"
-        "Entry/SL/TP only shown when highest probability ≥ 75%.\n"
-        "Below 75%: I tell you to avoid the trade.\n\n"
-        f"Auto-trade (BingX): {'ENABLED' if BINGX_ENABLE_AUTOTRADE else 'DISABLED'}\n"
-        "⚠ Futures are high risk. Use small size and test carefully.",
-        parse_mode="Markdown",
+        "/start - autoscan\n"
+        "/stop - stop autoscan\n"
+        "/autoscalp - start scalping\n"
+        "/autoscalp stop - stop scalping\n"
+        "/help - help"
     )
 
-
-# ============================================================
-# MAIN
-# ============================================================
+# ===============================================================
+# MAIN (WEBHOOK MODE)
+# ===============================================================
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("autoscalp", cmd_autoscalp))
+    app.add_handler(CommandHandler("start",cmd_start))
+    app.add_handler(CommandHandler("stop",cmd_stop))
+    app.add_handler(CommandHandler("help",cmd_help))
+    app.add_handler(CommandHandler("autoscalp",cmd_autoscalp))
+    app.add_handler(MessageHandler(filters.COMMAND,manual))
 
-    # All other commands → manual analysis
-    app.add_handler(MessageHandler(filters.COMMAND, manual_analyze))
+    # --- WEBHOOK SETUP ---
+    import asyncio
+    async def run():
+        url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+        await app.bot.set_webhook(url)
+        log.info(f"Webhook set to: {url}")
+        await app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook"
+        )
 
-    log.info("Bot starting (polling)...")
-    app.run_polling(drop_pending_updates=True)
+    asyncio.run(run())
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
